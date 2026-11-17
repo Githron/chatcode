@@ -13,6 +13,12 @@ let myRoom = "";
 let cryptoKey = null;
 let replyingTo = null;
 
+// ── Image size limit ──
+// The server caps ciphertext at 15M chars and engine.io at 20MB; we keep the
+// client pre-flight below both so the upload can never be killed mid-flight.
+const MAX_IMAGE_CHARS = 15 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+
 // ── DOM references ──
 const joinScreen      = document.getElementById("join-screen");
 const chatScreen      = document.getElementById("chat-screen");
@@ -234,7 +240,7 @@ imageBtn.addEventListener("click", () => imageInput.click());
 imageInput.addEventListener("change", async () => {
   const file = imageInput.files[0];
   if (!file) return;
-  if (file.size > 1500 * 1024) { alert("Image too large! Please choose an image under 1.5MB."); imageInput.value = ""; return; }
+  if (file.size > MAX_IMAGE_BYTES) { alert("Image too large! Please choose an image under 10MB."); imageInput.value = ""; return; }
   const indicator = document.createElement("div");
   indicator.className = "uploading-indicator";
   indicator.textContent = "Encrypting & sending...";
@@ -258,10 +264,13 @@ imageInput.addEventListener("change", async () => {
             isImage: replyingTo.isImage
           } : null
         };
+        if (payload.imageData.length > MAX_IMAGE_CHARS) {
+          throw new Error("EXCEEDS_LIMIT");
+        }
         socket.emit("send_image", payload);
         indicator.remove();
       } catch (err) {
-        appendSystemMessage("Image failed to encrypt — try a smaller image");
+        appendSystemMessage(err.message === "EXCEEDS_LIMIT" ? "Encrypted image too large" : "Image failed to encrypt — try a smaller image");
         indicator.remove();
       }
       imageInput.value = "";

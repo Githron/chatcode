@@ -45,13 +45,19 @@ const alice = await connect("alice");
 const bob = await connect("bob");
 
 console.log("🚪 Join room...");
-// Attach members listener BEFORE joining — server broadcasts immediately on join.
-const membersP = new Promise(res => alice.once("members_update", res));
+// Server broadcasts members_update to the WHOLE room (including the joiner) BEFORE
+// acking, so alice's own join fires members_update([alice]). Wait for the broadcast
+// that shows BOTH users — that's the one after bob joins.
+const bothMembersP = new Promise(res =>
+  alice.on("members_update", ({ members }) => {
+    if (members.length === 2 && members.some(m=>m.username==="alice") && members.some(m=>m.username==="bob")) res({ members });
+  })
+);
 const aJoin = await join(alice, "alice", ROOM);
 const bJoin = await join(bob, "bob", ROOM);
 ok(aJoin.ok && bJoin.ok, "both clients join room");
 
-const members = (await membersP).members;
+const members = (await Promise.race([bothMembersP, new Promise(res => setTimeout(() => res({ members: [] }), 5000))])).members;
 ok(members.length === 2 && members.some(m=>m.username==="alice") && members.some(m=>m.username==="bob"), "members list shows both users");
 
 // E2E: alice sends ciphertext only server could not read
@@ -94,10 +100,11 @@ const clearP = new Promise(res => bob.once("chat_cleared", res));
 await new Promise(res => alice.emit("clear_chat", { room: ROOM }, res));
 ok((await clearP).clearedBy === "alice", "clear_chat broadcast with clearedBy");
 
-// leave
-const leftP = new Promise(res => alice.once("user_left", res));
+// leave — bob must still be connected to receive the broadcast; alice leaving is
+// what triggers it, so race the wait instead of hanging if the server is down.
+const leftP = new Promise(res => bob.once("user_left", res));
 alice.disconnect();
-ok((await leftP).message.includes("alice"), "leave notice broadcast");
+ok((await Promise.race([leftP, new Promise(res => setTimeout(() => res({ message: "" }), 5000))])).message.includes("alice"), "leave notice broadcast");
 
 console.log(`\n📊 ${pass} passed, ${fail} failed`);
 bob.disconnect();

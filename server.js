@@ -10,6 +10,10 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, {
   connectionStateRecovery: { maxDisconnectionDuration: 60_000 },
   cors: { origin: "*" },
+  // Must cover the largest legal image after dataURL + AES-GCM + base64 expansion:
+  // 10MB raw → ~19MB ciphertext base64. engine.io defaults to 1e6 (1MB), which
+  // would 413-kill the transport before send_image ever reaches our handler.
+  maxHttpBufferSize: 20 * 1024 * 1024,
 });
 
 app.use(express.static("public"));
@@ -118,7 +122,9 @@ io.on("connection", (socket) => {
     if (rateLimited(socket.id)) return ack?.({ ok: false, error: "Too fast. Slow down." });
     const p = peers.get(socket.id);
     if (!p || p.room !== room) return ack?.({ ok: false, error: "Not in room." });
-    if (typeof imageData !== "string" || imageData.length > 3 * 1024 * 1024) {
+    if (typeof imageData !== "string" || imageData.length > 15 * 1024 * 1024) {
+      // 15M base64 chars ≈ 10MB raw file after dataURL + AES-GCM + base64 expansion.
+      // maxHttpBufferSize above must be >= this or engine.io 413s first.
       return ack?.({ ok: false, error: "Invalid image." });
     }
     io.to(room).emit("receive_image", {
