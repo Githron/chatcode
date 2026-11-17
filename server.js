@@ -14,11 +14,11 @@ const io = new Server(httpServer, {
 
 app.use(express.static("public"));
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// ── In-memory room state ──
+// In-memory room state
 // rooms: Map<roomCode, Set<socketId>>
-// usernames: Map<socketId, { username, room }>
+// peers: Map<socketId, { username, room }>
 const rooms = new Map();
 const peers = new Map();
 
@@ -53,8 +53,10 @@ function rateLimited(socketId) {
   return false;
 }
 
-// Validate room codes: 3–24 chars, alphanumeric + dash/underscore.
-// The code is only an identifier, never a network address we route to.
+// ── Room code validation ──
+// A room code is only an identifier users type to join a room.
+// It is never a network address we route to, so keep it strict:
+// 3-24 chars, alphanumeric + dash/underscore only.
 const ROOM_CODE = /^[A-Za-z0-9_-]{3,24}$/;
 function isValidRoom(code) {
   return typeof code === "string" && ROOM_CODE.test(code);

@@ -1,24 +1,27 @@
 {
   "name": "chatcode",
   "version": "1.0.0",
-  "description": "IPChat-inspired real-time room messenger",
-  "main": "script.js",
+  "description": "ChatCode — real-time room-based messenger with E2E-encrypted messages",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node e2e-test.mjs"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Githron/chatcode.git"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": ["chat", "socket.io", "messenger", "e2e"],
+  "author": "Githron",
   "license": "ISC",
   "type": "module",
   "bugs": {
     "url": "https://github.com/Githron/chatcode/issues"
   },
   "homepage": "https://github.com/Githron/chatcode#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^5.3.0",
     "socket.io": "^4.8.4"

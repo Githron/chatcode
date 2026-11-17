@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: chatcode
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /ping
+    envVars:
+      - key: NODE_ENV
+        value: production
