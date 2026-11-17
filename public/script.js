@@ -68,6 +68,22 @@ async function wakeServer() {
 joinBtn.disabled = true;
 wakeServer();
 
+// ── Base64 helpers (chunked — String.fromCharCode(...bigArray) blows the stack) ──
+function bytesToBase64(bytes) {
+  let out = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    out += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(out);
+}
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 // ── Derive encryption key from Room Code ──
 async function deriveKeyFromCode(code) {
   const encoder = new TextEncoder();
@@ -87,12 +103,12 @@ async function encryptText(plainText) {
   const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
   combined.set(iv, 0);
   combined.set(new Uint8Array(encrypted), iv.byteLength);
-  return btoa(String.fromCharCode(...combined));
+  return bytesToBase64(combined);
 }
 
 async function decryptText(base64) {
   try {
-    const combined = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+    const combined = base64ToBytes(base64);
     const iv = combined.slice(0, 12);
     const ciphertext = combined.slice(12);
     const decrypted = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
@@ -187,16 +203,20 @@ async function sendMessage() {
   const text = messageInput.value.trim();
   if (!text) return;
   stopTyping();
-  const payload = {
-    message: await encryptText(text),
-    room: myRoom,
-    reply: replyingTo ? {
-      username: replyingTo.username,
-      message: await encryptText(replyingTo.isImage ? "[Image]" : replyingTo.message),
-      isImage: replyingTo.isImage
-    } : null
-  };
-  socket.emit("send_message", payload);
+  try {
+    const payload = {
+      message: await encryptText(text),
+      room: myRoom,
+      reply: replyingTo ? {
+        username: replyingTo.username,
+        message: await encryptText(replyingTo.isImage ? "[Image]" : replyingTo.message),
+        isImage: replyingTo.isImage
+      } : null
+    };
+    socket.emit("send_message", payload);
+  } catch (err) {
+    appendSystemMessage("Message failed to encrypt — try again");
+  }
   messageInput.value = "";
   cancelReply();
   messageInput.focus();
@@ -214,29 +234,48 @@ imageBtn.addEventListener("click", () => imageInput.click());
 imageInput.addEventListener("change", async () => {
   const file = imageInput.files[0];
   if (!file) return;
-  if (file.size > 2 * 1024 * 1024) { alert("Image too large! Please choose an image under 2MB."); imageInput.value = ""; return; }
+  if (file.size > 1500 * 1024) { alert("Image too large! Please choose an image under 1.5MB."); imageInput.value = ""; return; }
   const indicator = document.createElement("div");
   indicator.className = "uploading-indicator";
   indicator.textContent = "Encrypting & sending...";
   messagesArea.appendChild(indicator);
   scrollToBottom();
-  const reader = new FileReader();
-  reader.onload = async (e) => {
-    const payload = {
-      imageData: await encryptText(e.target.result),
-      room: myRoom,
-      reply: replyingTo ? {
-        username: replyingTo.username,
-        message: await encryptText(replyingTo.isImage ? "[Image]" : replyingTo.message),
-        isImage: replyingTo.isImage
-      } : null
-    };
-    socket.emit("send_image", payload);
+  // Safety net: never let the indicator outlive a failed send
+  const failTimer = setTimeout(() => {
     indicator.remove();
-    imageInput.value = "";
-    cancelReply();
-  };
-  reader.readAsDataURL(file);
+    appendSystemMessage("Image failed to send — try a smaller image");
+  }, 30000);
+  try {
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const payload = {
+          imageData: await encryptText(e.target.result),
+          room: myRoom,
+          reply: replyingTo ? {
+            username: replyingTo.username,
+            message: await encryptText(replyingTo.isImage ? "[Image]" : replyingTo.message),
+            isImage: replyingTo.isImage
+          } : null
+        };
+        socket.emit("send_image", payload);
+        indicator.remove();
+      } catch (err) {
+        appendSystemMessage("Image failed to encrypt — try a smaller image");
+        indicator.remove();
+      }
+      imageInput.value = "";
+      cancelReply();
+    };
+    reader.onerror = () => {
+      appendSystemMessage("Could not read that image");
+      indicator.remove();
+      imageInput.value = "";
+    };
+    reader.readAsDataURL(file);
+  } finally {
+    clearTimeout(failTimer);
+  }
 });
 
 // ── Timestamp helper ──
