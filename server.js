@@ -1,178 +1,98 @@
-// ── ChatCode real-time chat server ──
-// Room code is only an identifier users type to join a room;
-// we never reveal anyone's real network IP.
 import express from "express";
-import { createServer } from "http";
+import { createServer } from "node:http";
+import { randomBytes, randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
+import { attachmentRoutes, clearFiles, publishFile } from "./attachments.js";
 
 const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  connectionStateRecovery: { maxDisconnectionDuration: 60_000 },
-  cors: { origin: "*" },
-  // Must cover the largest legal image after dataURL + AES-GCM + base64 expansion:
-  // 10MB raw → ~19MB ciphertext base64. engine.io defaults to 1e6 (1MB), which
-  // would 413-kill the transport before send_image ever reaches our handler.
-  maxHttpBufferSize: 20 * 1024 * 1024,
-});
-
-app.use(express.static("public"));
-
-const PORT = process.env.PORT || 3000;
-
-// In-memory room state
-// rooms: Map<roomCode, Set<socketId>>
-// peers: Map<socketId, { username, room }>
+app.disable("x-powered-by");
+const server = createServer(app);
+const io = new Server(server, { maxHttpBufferSize: 24 * 1024 });
 const rooms = new Map();
-const peers = new Map();
-
-const MAX_MESSAGE_LEN = 500;
-const MAX_USERNAME_LEN = 20;
-const RATE_WINDOW_MS = 1000;
-const RATE_MAX = 5;
-const rateLimiter = new Map(); // socketId -> [timestamps]
-
-function roomMembers(room) {
-  const set = rooms.get(room);
-  if (!set) return [];
-  return [...set]
-    .map((id) => {
-      const p = peers.get(id);
-      return p ? { id, username: p.username } : null;
-    })
-    .filter(Boolean);
-}
-
-function broadcastMembers(room) {
-  io.to(room).emit("members_update", { members: roomMembers(room) });
-}
-
-function rateLimited(socketId) {
-  const now = Date.now();
-  const hits = (rateLimiter.get(socketId) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
-  hits.push(now);
-  rateLimiter.set(socketId, hits);
-  if (hits.length > RATE_MAX) return true;
-  if (hits.length === 1) setTimeout(() => rateLimiter.delete(socketId), RATE_WINDOW_MS * 2);
-  return false;
-}
-
-// ── Room code validation ──
-// A room code is only an identifier users type to join a room.
-// It is never a network address we route to, so keep it strict:
-// 3-24 chars, alphanumeric + dash/underscore only.
-const ROOM_CODE = /^[A-Za-z0-9_-]{3,24}$/;
-function isValidRoom(code) {
-  return typeof code === "string" && ROOM_CODE.test(code);
-}
-
-const USERNAME_RE = /^[A-Za-z0-9_.-]{1,20}$/;
-
-io.on("connection", (socket) => {
-  let joinedRoom = null;
-
-  socket.on("join_room", ({ username, room }, ack) => {
-    const name = String(username ?? "").trim();
-    const code = String(room ?? "").trim();
-    if (!USERNAME_RE.test(name)) {
-      return ack?.({ ok: false, error: "Invalid username." });
-    }
-    if (!isValidRoom(code)) {
-      return ack?.({ ok: false, error: "Invalid room code." });
-    }
-
-    socket.data.username = name;
-    socket.data.room = code;
-    joinedRoom = code;
-    socket.join(code);
-    if (!rooms.has(code)) rooms.set(code, new Set());
-    rooms.get(code).add(socket.id);
-    peers.set(socket.id, { username: name, room: code });
-
-    broadcastMembers(code);
-    socket.to(code).emit("user_joined", { message: `${name} joined the room` });
-    ack?.({ ok: true });
-  });
-
-  socket.on("send_message", ({ message, room, reply }, ack) => {
-    if (rateLimited(socket.id)) return ack?.({ ok: false, error: "Too fast. Slow down." });
-    const p = peers.get(socket.id);
-    if (!p || p.room !== room || !rooms.get(room)?.has(socket.id)) {
-      return ack?.({ ok: false, error: "Not in room." });
-    }
-    if (typeof message !== "string" || !message.trim() || message.length > MAX_MESSAGE_LEN) {
-      return ack?.({ ok: false, error: "Invalid message." });
-    }
-    // Server never sees plaintext (E2E), but we still bound the ciphertext.
-    const safe = {
-      username: p.username,
-      message: message.slice(0, 4096),
-      senderId: socket.id,
-      reply: reply && typeof reply === "object" ? {
-        username: String(reply.username ?? "").slice(0, MAX_USERNAME_LEN),
-        message: String(reply.message ?? "").slice(0, 4096),
-        isImage: Boolean(reply.isImage),
-      } : null,
-    };
-    io.to(room).emit("receive_message", safe);
-    ack?.({ ok: true });
-  });
-
-  socket.on("send_image", ({ imageData, room, reply }, ack) => {
-    if (rateLimited(socket.id)) return ack?.({ ok: false, error: "Too fast. Slow down." });
-    const p = peers.get(socket.id);
-    if (!p || p.room !== room) return ack?.({ ok: false, error: "Not in room." });
-    if (typeof imageData !== "string" || imageData.length > 15 * 1024 * 1024) {
-      // 15M base64 chars ≈ 10MB raw file after dataURL + AES-GCM + base64 expansion.
-      // maxHttpBufferSize above must be >= this or engine.io 413s first.
-      return ack?.({ ok: false, error: "Invalid image." });
-    }
-    io.to(room).emit("receive_image", {
-      username: p.username,
-      imageData,
-      senderId: socket.id,
-      reply: reply && typeof reply === "object" ? {
-        username: String(reply.username ?? "").slice(0, MAX_USERNAME_LEN),
-        message: String(reply.message ?? "").slice(0, 4096),
-        isImage: Boolean(reply.isImage),
-      } : null,
-    });
-    ack?.({ ok: true });
-  });
-
-  socket.on("typing_start", ({ room }) => {
-    const p = peers.get(socket.id);
-    if (p && p.room === room) socket.to(room).emit("user_typing", { username: p.username });
-  });
-  socket.on("typing_stop", ({ room }) => {
-    const p = peers.get(socket.id);
-    if (p && p.room === room) socket.to(room).emit("user_stopped_typing", { username: p.username });
-  });
-
-  // Only the room member who issued the clear (verified by socket membership)
-  // can clear that room's chat. No cross-room action is possible.
-  socket.on("clear_chat", ({ room }, ack) => {
-    const p = peers.get(socket.id);
-    if (!p || p.room !== room) return ack?.({ ok: false, error: "Not authorized." });
-    io.to(room).emit("chat_cleared", { clearedBy: p.username });
-    ack?.({ ok: true });
-  });
-
-  socket.on("disconnect", () => {
-    const p = peers.get(socket.id);
-    if (p) {
-      rooms.get(p.room)?.delete(socket.id);
-      if (rooms.get(p.room)?.size === 0) rooms.delete(p.room);
-      peers.delete(socket.id);
-      broadcastMembers(p.room);
-      io.to(p.room).emit("user_left", { message: `${p.username} left the room` });
-    }
-    rateLimiter.delete(socket.id);
-  });
+const sessions = new Map();
+const channel = code => "chatcode:" + code;
+attachmentRoutes(app, sessions);
+app.use((req, res, next) => {
+  res.set({ "X-Content-Type-Options":"nosniff", "Referrer-Policy":"no-referrer",
+    "Content-Security-Policy":"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" });
+  next();
 });
-
 app.get("/ping", (_req, res) => res.sendStatus(200));
+app.use(express.static(fileURLToPath(new URL("./public/", import.meta.url))));
+const encoded = value => typeof value === "string" && value.length >= 40 && value.length <= 4096 && /^[A-Za-z0-9+/]+={0,2}$/.test(value);
+const uuid = value => typeof value === "string" && /^[a-f0-9-]{36}$/i.test(value);
 
-httpServer.listen(PORT, () => {
-  console.log(`ChatCode server listening on http://localhost:${PORT}`);
+function members(peer) {
+  const list = [...peer.state.members].map(([id, p]) => ({ id, username: p.username }));
+  io.to(channel(peer.room)).emit("members_update", { members: list });
+}
+
+io.on("connection", socket => {
+  let peer;
+  function handle(event, action) {
+    socket.on(event, (data, ack) => {
+      const answer = result => { if (typeof ack === "function") ack(result); };
+      if (!data || typeof data !== "object") return answer({ok:false,error:"Invalid request."});
+      if (event !== "join_room" && (!peer || data.room !== peer.room)) return answer({ok:false,error:"Join this room first."});
+      answer(action(data));
+    });
+  }
+  handle("join_room", ({ username, room }) => {
+    if (typeof username !== "string" || !/^[A-Za-z0-9_.-]{1,20}$/.test(username)) return {ok:false,error:"Use 1–20 letters, numbers, dots, dashes, or underscores for your name."};
+    if (typeof room !== "string" || !/^[a-zA-Z0-9_-]{3,24}$/.test(room)) return {ok:false,error:"Use a 3–24 character room code with letters, numbers, dashes, or underscores."};
+    if (peer) return peer.room === room && peer.username === username ? {ok:true,token:peer.token} : {ok:false,error:"Leave the current room first."};
+    const state = rooms.get(room) || { members:new Map(), receipts:new Map(), generation:0 };
+    rooms.set(room,state);
+    peer = { room, username, token:randomBytes(32).toString("hex"), state, recent:[] };
+    sessions.set(peer.token,peer);
+    state.members.set(socket.id,peer);
+    socket.join(channel(room));
+    members(peer);
+    socket.to(channel(room)).emit("user_joined",{message:username+" joined the room"});
+    return {ok:true,token:peer.token};
+  });
+  handle("send_message", ({ message, reply, attachmentId, clientId }) => {
+    if (clientId !== undefined && !uuid(clientId)) return {ok:false,error:"Invalid message ID."};
+    const receipts = peer.state.receipts;
+    if (clientId && receipts.has(clientId)) return {ok:true,id:receipts.get(clientId)};
+    if ((!encoded(message) && !(attachmentId && !message)) || (reply && (!encoded(reply.message) || typeof reply.username !== "string"))) return {ok:false,error:"Invalid message or reply."};
+    const now = Date.now();
+    peer.recent = peer.recent.filter(t => now-t<1000);
+    if (peer.recent.length >= 5) return {ok:false,error:"Please wait a moment before sending again."};
+    const attachment = attachmentId ? publishFile(attachmentId,peer) : null;
+    if (attachmentId && !attachment) return {ok:false,error:"Attachment expired. Please retry the upload."};
+    const id = randomUUID();
+    const safeReply = reply ? {username:reply.username.slice(0,20),message:reply.message,isImage:!!reply.isImage} : null;
+    peer.recent.push(now);
+    if (clientId) { receipts.set(clientId,id); if (receipts.size>512) receipts.delete(receipts.keys().next().value); }
+    io.to(channel(peer.room)).emit("receive_message",{id,username:peer.username,senderId:socket.id,sentAt:now,message:message||"",reply:safeReply,attachment});
+    return {ok:true,id};
+  });
+  for (const [event, notice] of [["typing_start","user_typing"],["typing_stop","user_stopped_typing"]]) {
+    handle(event, () => {
+      socket.to(channel(peer.room)).emit(notice,{username:peer.username,id:socket.id});
+      return {ok:true};
+    });
+  }
+  handle("clear_chat", () => {
+    peer.state.generation++;
+    clearFiles(peer.room);
+    peer.state.receipts.clear();
+    io.to(channel(peer.room)).emit("chat_cleared",{clearedBy:peer.username});
+    return {ok:true};
+  });
+  socket.on("disconnect", () => {
+    if (!peer) return;
+    sessions.delete(peer.token);
+    peer.state.members.delete(socket.id);
+    if (peer.state.members.size) {
+      members(peer);
+      socket.to(channel(peer.room)).emit("user_left",{id:socket.id,message:peer.username+" left the room"});
+    } else {
+      clearFiles(peer.room);
+      rooms.delete(peer.room);
+    }
+  });
 });
+server.listen(Number(process.env.PORT || 3000), () => console.log("ChatCode listening on port "+server.address().port));

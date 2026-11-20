@@ -1,427 +1,257 @@
-// ── Connect to Socket.IO server ──
-const socket = io({
-  transports: ["polling", "websocket"],
-  upgrade: true,
-  reconnection: true,
-  reconnectionAttempts: 5,
-  reconnectionDelay: 1000
+import { fileLimit, formats, sizeLabel, roomKey, encodeText, decodeText, upload, fetchFile } from "./transfer.js";
+
+const $ = id => document.getElementById(id);
+const socket = io();
+const mobile = matchMedia("(max-width:720px)");
+const history = $("history"), messages=$("messages"), input=$("message-input");
+let room="", username="", key, token="", joining=false, sending=false;
+let reply=null, file=null, filePreview="", stagedId="", clientId="", uploadController;
+let epoch=0, connectionVersion=0, renderQueue=Promise.resolve(), typingTimer, noticeTimer;
+let viewerUrl="", sharedDownloads=new AbortController(), nearBottom=true, typingSent=false;
+const typists=new Map();
+const make=(tag,cls,text)=>{
+  const node=document.createElement(tag);
+  if(cls) node.className=cls;
+  if(text!==undefined) node.textContent=text;
+  return node;
+};
+function icon(name){
+  const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  const use=document.createElementNS(svg.namespaceURI,"use");
+  svg.setAttribute("class","icon"); svg.setAttribute("aria-hidden","true");
+  use.setAttribute("href","#i-"+name); svg.append(use); return svg;
+}
+function button(label,symbol,fn){
+  const b=make("button"); b.type="button"; b.append(icon(symbol),document.createTextNode(label)); b.onclick=fn;return b;
+}
+function notice(text){
+  $("notice").textContent=text;clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>$("notice").textContent="",4200);
+}
+function emit(event,payload){
+  if(!socket.connected) return Promise.reject(new Error("Connection lost. Reconnect and retry."));
+  return new Promise((resolve,reject)=>socket.timeout(8500).emit(event,payload,(err,result)=>{
+    if(err) reject(new Error("No confirmation yet. Reconnect and retry."));
+    else if(!result?.ok) reject(new Error(result?.error||"Please try again."));
+    else resolve(result);
+  }));
+}
+function controls(){
+  $("join-btn").disabled=joining||!socket.connected;
+  $("join-btn").querySelector("span").textContent=joining?"Joining…":"Join room";
+  $("send-btn").disabled=sending||!token||(!file&&!input.value.trim());
+  input.readOnly=sending; $("attach").disabled=sending; $("remove-file").disabled=sending; $("reply-cancel").disabled=sending;
+}
+async function establish(name,code){
+  const version=connectionVersion;
+  const newKey=key&&room===code?key:await roomKey(code);
+  key=newKey;
+  const result=await emit("join_room",{username:name,room:code});
+  if(version!==connectionVersion) throw new Error("Connection changed. Please try again.");
+  username=name;room=code;token=result.token;
+  $("header-room").textContent=$("room-display").textContent=room;
+  $("network").textContent="Connected"; $("wake-status").textContent="";
+  $("join-screen").hidden=true;$("chat-screen").hidden=false;
+  updateDrawer();
+}
+$("join-form").onsubmit=async e=>{
+  e.preventDefault();if(joining)return;
+  const name=$("username-input").value.trim(),code=$("room-code-input").value.trim();
+  $("join-error").textContent="";
+  for(const [id,value,re,error] of [
+    ["username-input",name,/^[a-zA-Z0-9_.-]{1,20}$/,"Use 1–20 letters, numbers, dots, dashes, or underscores for your name."],
+    ["room-code-input",code,/^[a-zA-Z0-9_-]{3,24}$/,"Use a 3–24 character room code with letters, numbers, dashes, or underscores."]]){
+    $(id).removeAttribute("aria-invalid");
+    if(!re.test(value)){ $(id).setAttribute("aria-invalid","true");$("join-error").textContent=error;$(id).focus();return; }
+  }
+  joining=true;controls();
+  try{await establish(name,code);input.focus();}
+  catch(err){$("join-error").textContent=err.message;}
+  finally{joining=false;controls();}
+};
+socket.on("connect",async()=>{
+  $("wake-status").textContent="";
+  if(room){
+    try{await establish(username,room);notice("Reconnected to "+room);}
+    catch(err){$("network").textContent=err.message;}
+  }
+  controls();
 });
-
-// ── State ──
-let myUsername = "";
-let myRoom = "";
-let cryptoKey = null;
-let replyingTo = null;
-
-// ── Image size limit ──
-// The server caps ciphertext at 15M chars and engine.io at 20MB; we keep the
-// client pre-flight below both so the upload can never be killed mid-flight.
-const MAX_IMAGE_CHARS = 15 * 1024 * 1024;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-
-// ── DOM references ──
-const joinScreen      = document.getElementById("join-screen");
-const chatScreen      = document.getElementById("chat-screen");
-const usernameInput   = document.getElementById("username-input");
-const roomCodeInput = document.getElementById("room-code-input");
-const joinBtn         = document.getElementById("join-btn");
-const joinError       = document.getElementById("join-error");
-const messagesArea    = document.getElementById("messages");
-const messageInput    = document.getElementById("message-input");
-const sendBtn         = document.getElementById("send-btn");
-const leaveBtn        = document.getElementById("leave-btn");
-const roomDisplay     = document.getElementById("room-display");
-const headerIp        = document.getElementById("header-ip");
-const headerUsername  = document.getElementById("header-username");
-const userCount       = document.getElementById("user-count");
-const clearBtn        = document.getElementById("clear-btn");
-const imageBtn        = document.getElementById("image-btn");
-const imageInput      = document.getElementById("image-input");
-const menuToggle      = document.getElementById("menu-toggle");
-const sidebar         = document.querySelector(".sidebar");
-const replyPreview    = document.getElementById("reply-preview");
-const replyText       = document.getElementById("reply-text");
-const replyCancelBtn  = document.getElementById("reply-cancel");
-const membersList     = document.getElementById("members-list");
-
-// ── Connection status ──
-socket.on("connect", () => { console.log("✅ Connected:", socket.id); });
-socket.on("connect_error", (err) => { console.error("❌ Error:", err.message); });
-socket.on("disconnect", (reason) => { console.warn("⚠️ Disconnected:", reason); });
-
-// ── Mobile keyboard fix ──
-if (window.visualViewport) {
-  window.visualViewport.addEventListener("resize", () => {
-    const cs = document.getElementById("chat-screen");
-    if (cs) cs.style.height = window.visualViewport.height + "px";
-    scrollToBottom();
-  });
-}
-
-// ── Wake up server ──
-async function wakeServer() {
-  const statusEl = document.getElementById("wake-status");
-  try {
-    statusEl.textContent = "Connecting to server...";
-    await fetch("/ping");
-    statusEl.textContent = "";
-    joinBtn.disabled = false;
-  } catch (e) {
-    statusEl.textContent = "Server is waking up, please wait...";
-    setTimeout(wakeServer, 3000);
-  }
-}
-joinBtn.disabled = true;
-wakeServer();
-
-// ── Base64 helpers (chunked — String.fromCharCode(...bigArray) blows the stack) ──
-function bytesToBase64(bytes) {
-  let out = "";
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    out += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(out);
-}
-function base64ToBytes(b64) {
-  const bin = atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}
-
-// ── Derive encryption key from Room Code ──
-async function deriveKeyFromCode(code) {
-  const encoder = new TextEncoder();
-  const keyMaterial = await window.crypto.subtle.importKey(
-    "raw", encoder.encode(code), { name: "PBKDF2" }, false, ["deriveKey"]
-  );
-  return window.crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: encoder.encode("chatcode-salt-v1"), iterations: 100000, hash: "SHA-256" },
-    keyMaterial, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
-  );
-}
-
-async function encryptText(plainText) {
-  const encoder = new TextEncoder();
-  const iv = window.crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, cryptoKey, encoder.encode(plainText));
-  const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(encrypted), iv.byteLength);
-  return bytesToBase64(combined);
-}
-
-async function decryptText(base64) {
-  try {
-    const combined = base64ToBytes(base64);
-    const iv = combined.slice(0, 12);
-    const ciphertext = combined.slice(12);
-    const decrypted = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
-    return new TextDecoder().decode(decrypted);
-  } catch { return "🔒 Unable to decrypt message"; }
-}
-
-// ── Validate Room Code ──
-function isValidRoomCode(value) {
-  return /^[A-Za-z0-9_-]{3,24}$/.test(value.trim());
-}
-
-// ── JOIN ──
-async function joinRoom() {
-  const username = usernameInput.value.trim();
-  const code = roomCodeInput.value.trim();
-  if (!username) { showError("Please enter a username."); usernameInput.focus(); return; }
-  if (!code) { showError("Please enter a room code."); roomCodeInput.focus(); return; }
-  if (!isValidRoomCode(code)) { showError("That doesn't look like a valid room code."); roomCodeInput.focus(); return; }
-
-  joinBtn.disabled = true;
-  joinBtn.querySelector("span").textContent = "SECURING...";
-  cryptoKey = await deriveKeyFromCode(code);
-
-  myUsername = username;
-  myRoom = code;
-  const res = await new Promise((resolve) => {
-    socket.emit("join_room", { username: myUsername, room: myRoom }, resolve);
-  });
-  if (!res || res.ok === false) {
-    showError(res?.error || "Could not join room.");
-    cryptoKey = null;
-    return;
-  }
-
-  joinScreen.classList.remove("active");
-  chatScreen.classList.add("active");
-  roomDisplay.textContent = myRoom;
-  headerIp.textContent = myRoom;
-  headerUsername.textContent = myUsername;
-  messageInput.focus();
-}
-
-function showError(msg) {
-  joinError.textContent = msg;
-  joinError.style.animation = "none";
-  void joinError.offsetWidth;
-  joinError.style.animation = "";
-  joinBtn.disabled = false;
-  joinBtn.querySelector("span").textContent = "CONNECT";
-}
-
-joinBtn.addEventListener("click", joinRoom);
-usernameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
-roomCodeInput.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); });
-
-// ── MEMBERS LIST ──
-socket.on("members_update", ({ members }) => {
-  userCount.textContent = members.length;
-  membersList.innerHTML = "";
-  members.forEach(({ id, username }) => {
-    const isMe = id === socket.id;
-    const item = document.createElement("div");
-    item.className = `member-item${isMe ? " member-me" : ""}`;
-    item.innerHTML = `
-      <span class="member-dot"></span>
-      <span class="member-name">${escapeHtml(username)}</span>
-      ${isMe ? '<span class="member-you-tag">you</span>' : ""}
-    `;
-    membersList.appendChild(item);
-  });
+socket.on("disconnect",()=>{
+  connectionVersion++;token="";stagedId="";uploadController?.abort();stopTyping();resetTypists();
+  $("network").textContent="Reconnecting…";$("wake-status").textContent="Reconnecting…";controls();
 });
-
-// ── REPLY SYSTEM ──
-function setReply(username, message, isImage = false) {
-  replyingTo = { username, message, isImage };
-  replyText.textContent = isImage ? `📷 ${username}: [Image]` : `${username}: ${message.slice(0, 60)}${message.length > 60 ? "…" : ""}`;
-  replyPreview.classList.add("active");
-  messageInput.focus();
-  scrollToBottom();
+socket.on("connect_error",()=>{$("wake-status").textContent="Connecting to the server…";controls();});
+$("leave-btn").onclick=()=>location.reload();
+$("clear-btn").onclick=async()=>{
+  if(!confirm("Clear messages and shared files for everyone in this room?"))return;
+  try{await emit("clear_chat",{room});}catch(err){notice(err.message);}
+};
+$("copy").onclick=async()=>{try{await navigator.clipboard.writeText(room);notice("Room code copied.");}catch{notice("Room code: "+room);}};
+let drawerOpen=false;
+function updateDrawer(open=false){
+  drawerOpen=mobile.matches&&open;
+  $("sidebar").classList.toggle("open",drawerOpen);
+  $("sidebar").inert=mobile.matches&&!drawerOpen;
+  $("backdrop").hidden=!drawerOpen;
+  $("main-room").inert=drawerOpen;
+  $("menu-toggle").setAttribute("aria-expanded",String(drawerOpen));
 }
-
-function cancelReply() {
-  replyingTo = null;
-  replyPreview.classList.remove("active");
-}
-
-replyCancelBtn.addEventListener("click", cancelReply);
-
-// ── SEND MESSAGE ──
-async function sendMessage() {
-  const text = messageInput.value.trim();
-  if (!text) return;
-  stopTyping();
-  try {
-    const payload = {
-      message: await encryptText(text),
-      room: myRoom,
-      reply: replyingTo ? {
-        username: replyingTo.username,
-        message: await encryptText(replyingTo.isImage ? "[Image]" : replyingTo.message),
-        isImage: replyingTo.isImage
-      } : null
-    };
-    socket.emit("send_message", payload);
-  } catch (err) {
-    appendSystemMessage("Message failed to encrypt — try again");
+$("menu-toggle").onclick=()=>{updateDrawer(true);$("drawer-close").focus();};
+function closeDrawer(){updateDrawer();$("menu-toggle").focus();}
+$("drawer-close").onclick=$("backdrop").onclick=closeDrawer;
+document.addEventListener("keydown",e=>{
+  if(drawerOpen&&e.key==="Escape"){closeDrawer();return;}
+  if(drawerOpen&&e.key==="Tab"){
+    if(e.shiftKey&&document.activeElement===$("drawer-close")){e.preventDefault();$("leave-btn").focus();}
+    else if(!e.shiftKey&&document.activeElement===$("leave-btn")){e.preventDefault();$("drawer-close").focus();}
   }
-  messageInput.value = "";
-  cancelReply();
-  messageInput.focus();
-}
-
-sendBtn.addEventListener("click", sendMessage);
-messageInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-  if (e.key === "Escape") cancelReply();
 });
-
-// ── SEND IMAGE ──
-imageBtn.addEventListener("click", () => imageInput.click());
-
-imageInput.addEventListener("change", async () => {
-  const file = imageInput.files[0];
-  if (!file) return;
-  if (file.size > MAX_IMAGE_BYTES) { alert("Image too large! Please choose an image under 10MB."); imageInput.value = ""; return; }
-  const indicator = document.createElement("div");
-  indicator.className = "uploading-indicator";
-  indicator.textContent = "Encrypting & sending...";
-  messagesArea.appendChild(indicator);
-  scrollToBottom();
-  // Safety net: never let the indicator outlive a failed send
-  const failTimer = setTimeout(() => {
-    indicator.remove();
-    appendSystemMessage("Image failed to send — try a smaller image");
-  }, 30000);
-  try {
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      try {
-        const payload = {
-          imageData: await encryptText(e.target.result),
-          room: myRoom,
-          reply: replyingTo ? {
-            username: replyingTo.username,
-            message: await encryptText(replyingTo.isImage ? "[Image]" : replyingTo.message),
-            isImage: replyingTo.isImage
-          } : null
-        };
-        if (payload.imageData.length > MAX_IMAGE_CHARS) {
-          throw new Error("EXCEEDS_LIMIT");
-        }
-        socket.emit("send_image", payload);
-        indicator.remove();
-      } catch (err) {
-        appendSystemMessage(err.message === "EXCEEDS_LIMIT" ? "Encrypted image too large" : "Image failed to encrypt — try a smaller image");
-        indicator.remove();
+mobile.addEventListener("change",()=>updateDrawer());
+socket.on("members_update",({members})=>{
+  $("user-count").textContent=members.length;
+  $("members-list").replaceChildren(...members.map(m=>{
+    const self=m.id===socket.id, li=make("li","member"+(self?" self":""));
+    const avatar=make("span","avatar",m.username.slice(0,2).toUpperCase());avatar.setAttribute("aria-hidden","true");
+    li.append(avatar,make("span","member-name",m.username));if(self)li.append(make("small","","You"));return li;
+  }));
+});
+function bottom(){history.scrollTop=history.scrollHeight;$("latest").hidden=true;nearBottom=true;}
+history.addEventListener("scroll",()=>{nearBottom=history.scrollHeight-history.scrollTop-history.clientHeight<64;if(nearBottom)$("latest").hidden=true;});
+$("latest").onclick=bottom;
+function append(node,own=false){
+  const follow=nearBottom||own;
+  $("empty").hidden=true;messages.append(node);
+  if(messages.children.length>250)messages.firstElementChild.remove();
+  if(follow)bottom();else $("latest").hidden=false;
+}
+function resetReply(){
+  reply=null;$("reply-preview").hidden=true;
+}
+function chooseReply(author,text){
+  if(sending)return;
+  reply={username:author,message:text.slice(0,160)};
+  $("reply-preview").querySelector("span").textContent="Reply to "+author+" · "+reply.message;
+  $("reply-preview").hidden=false;clientId="";input.focus();
+}
+$("reply-cancel").onclick=()=>{resetReply();clientId="";input.focus();};
+function resetFile(){
+  if(filePreview)URL.revokeObjectURL(filePreview);
+  filePreview="";file=null;stagedId="";$("file-input").value="";
+  $("file-tray").hidden=true;$("file-thumb").replaceChildren();
+}
+$("attach").onclick=()=>$("file-input").click();
+$("remove-file").onclick=()=>{resetFile();clientId="";controls();input.focus();};
+$("file-input").onchange=e=>{
+  const next=e.target.files[0];if(!next)return;
+  if(!formats.test(next.name)||!next.size||next.size>fileLimit){
+    $("send-error").textContent="Choose a PNG, JPEG, WebP, PDF, Office or text file up to 10 MiB.";$("file-input").value="";return;
+  }
+  resetFile();file=next;clientId="";$("send-error").textContent="";
+  if(/\.(png|jpe?g|webp)$/i.test(file.name)){
+    const img=make("img");filePreview=URL.createObjectURL(file);img.src=filePreview;img.alt="";$("file-thumb").append(img);
+  }else $("file-thumb").append(icon("file"));
+  $("file-detail").textContent=file.name+" · "+sizeLabel(file.size);$("file-tray").hidden=false;controls();input.focus();
+};
+function showProgress(label,percent){
+  $("transfer").hidden=false;$("transfer").querySelector("progress").value=percent;$("transfer-label").textContent=label;
+}
+$("composer").onsubmit=async e=>{
+  e.preventDefault();if(sending||!token||(!input.value.trim()&&!file))return;
+  const generation=epoch, text=input.value.trim();
+  clientId ||= crypto.randomUUID();
+  sending=true;controls();stopTyping();$("send-error").textContent="";
+  uploadController=new AbortController();
+  try{
+    if(file&&!stagedId)stagedId=(await upload(file,key,token,uploadController.signal,showProgress)).id;
+    const payload={room,clientId,message:text?await encodeText(key,text):"",attachmentId:stagedId||undefined,
+      reply:reply?{username:reply.username,message:await encodeText(key,reply.message)}:null};
+    if(generation!==epoch)throw new Error("The room was cleared. Review your draft and send again.");
+    if(file)showProgress("Sending to room…",100);
+    await emit("send_message",payload);
+    input.value="";resetFile();resetReply();clientId="";
+  }catch(err){
+    if(/expired|room was cleared/i.test(err.message))stagedId="";
+    $("send-error").textContent=err.message;
+  }finally{sending=false;uploadController=null;$("transfer").hidden=true;controls();if(!drawerOpen&&!mobile.matches)input.focus();}
+};
+input.onkeydown=e=>{
+  if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();$("composer").requestSubmit();}
+  if(e.key==="Escape"&&!sending){resetReply();clientId="";}
+};
+function stopTyping(){
+  clearTimeout(typingTimer);
+  if(typingSent&&socket.connected&&token)socket.emit("typing_stop",{room});
+  typingSent=false;
+}
+input.oninput=()=>{
+  clientId="";controls();if(!token)return;
+  if(!input.value){stopTyping();return;}
+  if(!typingSent){socket.emit("typing_start",{room});typingSent=true;}
+  clearTimeout(typingTimer);typingTimer=setTimeout(stopTyping,1400);
+};
+function showTypists(){
+  const names=[...typists.values()].map(t=>t.name);
+  $("typing").textContent=names.length===1?names[0]+" is typing…":names.length>1?"Several people are typing…":"";
+}
+function removeTypist(id){clearTimeout(typists.get(id)?.timer);typists.delete(id);showTypists();}
+function resetTypists(){for(const id of [...typists.keys()])removeTypist(id);}
+socket.on("user_typing",({id,username:name})=>{
+  clearTimeout(typists.get(id)?.timer);
+  typists.set(id,{name,timer:setTimeout(()=>removeTypist(id),4500)});showTypists();
+});
+socket.on("user_stopped_typing",({id})=>removeTypist(id));
+socket.on("user_left",({id,message})=>{removeTypist(id);append(make("p","system",message));});
+socket.on("user_joined",({message})=>append(make("p","system",message)));
+socket.on("chat_cleared",({clearedBy})=>{
+  epoch++;uploadController?.abort();sharedDownloads.abort();sharedDownloads=new AbortController();
+  stagedId="";clientId="";resetReply();resetTypists();messages.replaceChildren();nearBottom=true;
+  if($("viewer").open)$("viewer").close();
+  append(make("p","system",clearedBy+" cleared the conversation."));
+});
+function attachmentView(f){
+  const wrap=make("div","attachment"), info=make("div","file-info"), summary=make("div");
+  summary.append(make("strong","file-name",f.name),make("small","",sizeLabel(f.size)));
+  info.append(icon("file"),summary);wrap.append(info);
+  async function load(b,view){
+    const generation=epoch;b.disabled=true;b.setAttribute("aria-busy","true");
+    try{
+      const blob=await fetchFile(f,key,token,sharedDownloads.signal);
+      if(generation!==epoch)return;
+      const url=URL.createObjectURL(blob);
+      if(view){
+        if(viewerUrl)URL.revokeObjectURL(viewerUrl);
+        viewerUrl=url;$("viewer-name").textContent=f.name;$("full-image").src=url;$("full-image").alt=f.name;
+        if(!$("viewer").open)$("viewer").showModal();
+      }else{
+        const link=make("a");link.href=url;link.download=f.name;document.body.append(link);link.click();link.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),10000);
       }
-      imageInput.value = "";
-      cancelReply();
-    };
-    reader.onerror = () => {
-      appendSystemMessage("Could not read that image");
-      indicator.remove();
-      imageInput.value = "";
-    };
-    reader.readAsDataURL(file);
-  } finally {
-    clearTimeout(failTimer);
+    }catch(err){if(err.name!=="AbortError")notice(err.message);}
+    finally{b.disabled=false;b.removeAttribute("aria-busy");}
   }
+  if(f.type.startsWith("image/")){
+    const preview=button("Preview","chat",e=>load(e.currentTarget,true));wrap.append(preview);
+  }
+  wrap.append(button("Download","download",e=>load(e.currentTarget,false)));return wrap;
+}
+$("close-viewer").onclick=()=>$("viewer").close();
+$("viewer").onclose=()=>{$("full-image").removeAttribute("src");URL.revokeObjectURL(viewerUrl);viewerUrl="";};
+socket.on("receive_message",data=>{
+  const generation=epoch, own=data.senderId===socket.id, currentKey=key;
+  renderQueue=renderQueue.then(async()=>{
+    const text=await decodeText(currentKey,data.message);
+    const quoted=data.reply?await decodeText(currentKey,data.reply.message):"";
+    if(generation!==epoch)return;
+    const node=make("article","msg"+(own?" self":"")), meta=make("div","meta");
+    const date=new Date(data.sentAt),time=make("time","",date.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}));time.dateTime=date.toISOString();
+    meta.append(make("strong","",own?"You":data.username),time);
+    const bubble=make("div","bubble");
+    if(data.reply)bubble.append(make("blockquote","",data.reply.username+" · "+quoted));
+    if(data.attachment)bubble.append(attachmentView(data.attachment));
+    if(text)bubble.append(make("p","",text));
+    const action=button("Reply","reply",()=>chooseReply(data.username,text||data.attachment?.name||"Attachment"));
+    action.className="reply-action";action.setAttribute("aria-label","Reply to "+data.username);
+    node.append(meta,bubble,action);append(node,own);
+  }).catch(()=>notice("This message could not be displayed."));
 });
-
-// ── Timestamp helper ──
-function getTimestamp() {
-  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-// ── TYPING INDICATOR ──
-const typingIndicator = document.getElementById("typing-indicator");
-let typingTimeout = null;
-let isTyping = false;
-const typingUsers = {};
-
-messageInput.addEventListener("input", () => {
-  if (!myRoom) return;
-  if (!isTyping) { isTyping = true; socket.emit("typing_start", { room: myRoom }); }
-  clearTimeout(typingTimeout);
-  typingTimeout = setTimeout(() => { isTyping = false; socket.emit("typing_stop", { room: myRoom }); }, 1500);
-});
-
-function stopTyping() {
-  if (isTyping) { isTyping = false; clearTimeout(typingTimeout); socket.emit("typing_stop", { room: myRoom }); }
-}
-
-socket.on("user_typing", ({ username }) => { typingUsers[username] = true; renderTypingIndicator(); });
-socket.on("user_stopped_typing", ({ username }) => { delete typingUsers[username]; renderTypingIndicator(); });
-
-function renderTypingIndicator() {
-  const names = Object.keys(typingUsers);
-  if (names.length === 0) { typingIndicator.innerHTML = ""; return; }
-  const label = names.length === 1
-    ? `<span class="typing-name">${escapeHtml(names[0])}</span> is typing`
-    : names.length === 2
-    ? `<span class="typing-name">${escapeHtml(names[0])}</span> and <span class="typing-name">${escapeHtml(names[1])}</span> are typing`
-    : `<span class="typing-name">Several people</span> are typing`;
-  typingIndicator.innerHTML = `${label}<div class="typing-dots"><span></span><span></span><span></span></div>`;
-  scrollToBottom();
-}
-
-// ── CLEAR CHAT ──
-clearBtn.addEventListener("click", () => {
-  if (confirm("Clear the chat for everyone in this room?")) socket.emit("clear_chat", { room: myRoom });
-});
-socket.on("chat_cleared", ({ clearedBy }) => {
-  messagesArea.innerHTML = `<div class="welcome-msg"><span>— Start of conversation —</span></div>`;
-  appendSystemMessage(`${clearedBy} cleared the chat`);
-  Object.keys(typingUsers).forEach(k => delete typingUsers[k]);
-  renderTypingIndicator();
-  cancelReply();
-});
-
-// ── LEAVE ROOM ──
-leaveBtn.addEventListener("click", () => location.reload());
-
-// ── MOBILE SIDEBAR ──
-menuToggle.addEventListener("click", () => sidebar.classList.toggle("open"));
-document.addEventListener("click", (e) => {
-  if (sidebar.classList.contains("open") && !sidebar.contains(e.target) && e.target !== menuToggle)
-    sidebar.classList.remove("open");
-});
-
-// ── SOCKET EVENTS ──
-socket.on("receive_message", async ({ username, message, senderId, reply }) => {
-  const decrypted = await decryptText(message);
-  const decryptedReply = reply ? { username: reply.username, message: await decryptText(reply.message), isImage: reply.isImage } : null;
-  appendMessage({ username, message: decrypted, timestamp: getTimestamp(), isSelf: senderId === socket.id, reply: decryptedReply });
-});
-
-socket.on("receive_image", async ({ username, imageData, senderId, reply }) => {
-  const decrypted = await decryptText(imageData);
-  const decryptedReply = reply ? { username: reply.username, message: await decryptText(reply.message), isImage: reply.isImage } : null;
-  appendImage({ username, imageData: decrypted, timestamp: getTimestamp(), isSelf: senderId === socket.id, reply: decryptedReply });
-});
-
-socket.on("user_joined", ({ message }) => appendSystemMessage(message));
-socket.on("user_left", ({ message }) => appendSystemMessage(message));
-
-// ── HELPERS ──
-function buildReplyBlock(reply) {
-  if (!reply) return "";
-  return `
-    <div class="reply-block">
-      <span class="reply-author">${escapeHtml(reply.username)}</span>
-      <span class="reply-content">${reply.isImage ? "📷 Image" : escapeHtml(reply.message.slice(0, 80))}${(!reply.isImage && reply.message.length > 80) ? "…" : ""}</span>
-    </div>`;
-}
-
-function appendMessage({ username, message, timestamp, isSelf, reply }) {
-  const div = document.createElement("div");
-  div.className = `msg ${isSelf ? "self" : "other"}`;
-  div.innerHTML = `
-    <div class="msg-meta">
-      <span class="msg-author">${escapeHtml(username)}</span>
-      <span class="msg-time">${timestamp}</span>
-    </div>
-    <div class="msg-bubble">${buildReplyBlock(reply)}${escapeHtml(message)}</div>`;
-  div.addEventListener("dblclick", () => setReply(username, message, false));
-  messagesArea.appendChild(div);
-  scrollToBottom();
-}
-
-function appendImage({ username, imageData, timestamp, isSelf, reply }) {
-  const div = document.createElement("div");
-  div.className = `msg ${isSelf ? "self" : "other"}`;
-  div.innerHTML = `
-    <div class="msg-meta">
-      <span class="msg-author">${escapeHtml(username)}</span>
-      <span class="msg-time">${timestamp}</span>
-    </div>
-    <div class="msg-bubble" style="padding:6px;background:transparent;border:none;">
-      ${buildReplyBlock(reply)}
-      <img src="${imageData}" class="msg-image" alt="Image" />
-    </div>`;
-  div.querySelector(".msg-image").addEventListener("click", (e) => openImageOverlay(e.target.src));
-  div.addEventListener("dblclick", () => setReply(username, "", true));
-  messagesArea.appendChild(div);
-  scrollToBottom();
-}
-
-function openImageOverlay(src) {
-  const overlay = document.createElement("div");
-  overlay.className = "img-overlay";
-  overlay.innerHTML = `<img src="${src}" alt="Full image" />`;
-  overlay.addEventListener("click", () => overlay.remove());
-  document.body.appendChild(overlay);
-}
-
-function appendSystemMessage(text) {
-  const div = document.createElement("div");
-  div.className = "system-msg";
-  div.textContent = text;
-  messagesArea.appendChild(div);
-  scrollToBottom();
-}
-
-function scrollToBottom() { messagesArea.scrollTop = messagesArea.scrollHeight; }
-
-function escapeHtml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
+controls();

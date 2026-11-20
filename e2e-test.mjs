@@ -1,111 +1,99 @@
-// E2E test: two clients, one room — join, chat, E2E encrypt/decrypt, images, typing, clear, leave.
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { webcrypto, randomUUID } from "node:crypto";
+import test from "node:test";
 import { io } from "socket.io-client";
+import { roomKey, encodeText, decodeText, seal, unseal, fileLimit } from "./public/transfer.js";
 
-const URL = "http://localhost:3000";
-const ROOM = "ferrari-f1";
+if (!globalThis.crypto) globalThis.crypto = webcrypto;
+const room = "integration-room";
+const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6AFcAAAAASUVORK5CYII=","base64");
+const docx = Buffer.from("UEsDBBQAAAAIAJO4dF2sbhJangAAANwAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbF2PsQ7CMBBDf6XKitqrGBhQ24UdGPiBU3JtI5pLlBwF/p4EpA6Mlu1nubu9A6Xq5RZOvZpFwhEg6ZkcpsYH4uyMPjqULOMEAfUdJ4J92x5AexZiqaUw1NBdVorRGqquGOWMjnoFTx8NGK8fLiebTFPV6Vcry73CEBarUaxnWNn8bdZ+HK2mrV9oIXpNKVme3NJsjkPLu4KHoYPvqeEDUEsDBBQAAAAIAJO4dF1hey9DiQAAAPIAAAALAAAAX3JlbHMvLnJlbHONzzsOAiEQBuCrEA6ws1pYGKCy2dZ4AQLDIy6PDBj19lJYrMbCcuaffH9GnHHVPZbcQqyNPdKam+Sh93oEaCZg0m0qFfNIXKGk+xjJQ9Xmqj3Cfp4PQFuDK7E12WIlp8XuOLs8K/5jF+eiwVMxt4S5/6j4uhiyJo9d8nshC/a9ngbLQQn4eFG9AFBLAwQUAAAACACTuHRdyUDSwnYAAACcAAAAEQAAAHdvcmQvZG9jdW1lbnQueG1sRc7BDcIwDAXQVaoOgCsOHKKQIdggJKGtVNuRbZSyPU05cHlfX5al75vLnN5YyIYdN1LX7uNiVh2ApqVg1AvXQsftxYLRjiozNJZchVNRXWnGDa7TdAOMK43BN/fk/OlZO9Kx8GDGgdiKeui9K6f19PcD/z3hC1BLAQIUAxQAAAAIAJO4dF2sbhJangAAANwAAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAgAk7h0XWF7L0OJAAAA8gAAAAsAAAAAAAAAAAAAAIABzwAAAF9yZWxzLy5yZWxzUEsBAhQDFAAAAAgAk7h0XclA0sJ2AAAAnAAAABEAAAAAAAAAAAAAAIABgQEAAHdvcmQvZG9jdW1lbnQueG1sUEsFBgAAAAADAAMAuQAAACYCAAAAAA==","base64");
 
-let pass = 0, fail = 0;
-const ok = (cond, name) => {
-  if (cond) { pass++; console.log(`  ✅ ${name}`); }
-  else { fail++; console.log(`  ❌ ${name}`); }
-};
-
-// Minimal client-side crypto mirror (same params as public/script.js)
-async function deriveKey(ip) {
-  const enc = new TextEncoder();
-  const km = await crypto.subtle.importKey("raw", enc.encode(ip), "PBKDF2", false, ["deriveKey"]);
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: enc.encode("ipchat-salt-v1"), iterations: 100000, hash: "SHA-256" },
-    km, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+function next(socket,event) {
+  return new Promise((resolve,reject)=>{
+    const onData = data => { clearTimeout(timer); resolve(data); };
+    const timer=setTimeout(()=>{ socket.off(event,onData); reject(new Error("Timed out waiting for "+event)); },3500);
+    socket.once(event,onData);
+  });
 }
-async function encrypt(key, text) {
-  const enc = new TextEncoder();
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(text));
-  const combo = new Uint8Array(12 + ct.byteLength);
-  combo.set(iv, 0); combo.set(new Uint8Array(ct), 12);
-  return btoa(String.fromCharCode(...combo));
-}
-async function decrypt(key, b64) {
-  const combo = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: combo.slice(0,12) }, key, combo.slice(12));
-  return new TextDecoder().decode(pt);
+function request(socket,event,data) {
+  return socket.timeout(3500).emitWithAck(event,data);
 }
 
-const connect = (username) => new Promise((res, rej) => {
-  const s = io(URL, { transports: ["polling", "websocket"] });
-  s.on("connect", () => res(s));
-  s.on("connect_error", rej);
+test("two-client room and private attachment transfers", {timeout:40000}, async t=>{
+  const server=spawn(process.execPath,["server.js"],{cwd:new URL("./",import.meta.url),env:{...process.env,PORT:"0"},stdio:["ignore","pipe","inherit"]});
+  const clients=[];
+  t.after(async()=>{
+    clients.forEach(c=>c.disconnect());
+    if(server.exitCode===null){const ended=once(server,"exit");server.kill();await ended;}
+  });
+  const [line]=await once(server.stdout,"data");
+  const port=/port (\d+)/.exec(String(line))?.[1];
+  assert.ok(port,"server published its listening port");
+  const url="http://127.0.0.1:"+port;
+  const connect=async()=>{
+    const client=io(url,{autoConnect:false,reconnection:false});
+    clients.push(client);
+    const ready=next(client,"connect");client.connect();await ready;return client;
+  };
+  const alice=await connect(),bob=await connect(),other=await connect();
+  const join=(s,name,code)=>request(s,"join_room",{username:name,room:code});
+  const a=await join(alice,"Alice",room);
+  const membership=next(alice,"members_update");
+  const b=await join(bob,"Bob",room);
+  assert.deepEqual((await membership).members.map(m=>m.username),["Alice","Bob"]);
+  assert.equal((await join(other,"Casey","bad code")).ok,false);
+  const outsider=await join(other,"Casey","another-room");
+  assert.ok(a.ok&&b.ok&&outsider.ok);
+  const key=await roomKey(room);
+  const auth=token=>({Authorization:"Bearer "+token});
+  async function upload(name,data,token=a.token){
+    return fetch(url+"/api/files",{method:"POST",headers:{...auth(token),"Content-Type":"application/octet-stream","X-File-Name":encodeURIComponent(name)},body:await seal(key,data)});
+  }
+  const download=(id,token)=>fetch(url+"/api/files/"+id,{headers:auth(token)});
+  async function publish(id){
+    const recv=next(bob,"receive_message");
+    const sent=await request(alice,"send_message",{room,clientId:randomUUID(),message:"",attachmentId:id});
+    assert.ok(sent.ok);return recv;
+  }
+  await t.test("encrypted 500-character text, retry, reply and typing",async()=>{
+    const plain="界".repeat(500),message=await encodeText(key,plain),clientId=randomUUID();
+    const incoming=next(bob,"receive_message");
+    const payload={room,message,clientId};
+    const sent=await request(alice,"send_message",payload);
+    assert.ok(sent.ok);assert.equal(await decodeText(key,(await incoming).message),plain);
+    assert.deepEqual(await request(alice,"send_message",payload),sent);
+    const answer=next(alice,"receive_message");
+    await request(bob,"send_message",{room,message:await encodeText(key,"Reply"),reply:{username:"Alice",message:await encodeText(key,"Excerpt")}});
+    assert.equal(await decodeText(key,(await answer).reply.message),"Excerpt");
+    const typing=next(alice,"user_typing");bob.emit("typing_start",{room});assert.equal((await typing).username,"Bob");
+  });
+  let last;
+  for(const [name,data] of [["sample.png",png],["notes.pdf",Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")],["notes.docx",docx],["notes.txt",Buffer.from("Meeting notes")]]){
+    await t.test("upload, publish and byte-for-byte download of "+name,async()=>{
+      const uploaded=await upload(name,data);assert.equal(uploaded.status,201);
+      const f=await uploaded.json();assert.equal(f.name,name);
+      assert.equal((await download(f.id,b.token)).status,404);
+      const incoming=await publish(f.id);assert.equal(incoming.attachment.size,data.length);
+      const fetched=await download(f.id,b.token);assert.equal(fetched.status,200);
+      const cipher=new Uint8Array(await fetched.arrayBuffer());
+      assert.deepEqual(Buffer.from(await unseal(key,cipher)),data);
+      assert.equal((await download(f.id,outsider.token)).status,404);
+      assert.equal((await download(f.id,"")).status,401);
+      last=f.id;
+    });
+  }
+  await t.test("validation, room clear and revoked access",async()=>{
+    assert.equal((await upload("wrong.png",Buffer.from("This is text"))).status,415);
+    assert.equal((await upload("ordinary.docx",Buffer.from("This is text"))).status,415);
+    assert.equal((await upload("empty.txt",Buffer.alloc(0))).status,413);
+    assert.equal((await upload("large.txt",Buffer.alloc(fileLimit+1,65))).status,413);
+    assert.equal((await request(other,"clear_chat",{room})).ok,false);
+    const cleared=next(bob,"chat_cleared");await request(alice,"clear_chat",{room});assert.equal((await cleared).clearedBy,"Alice");
+    assert.equal((await download(last,b.token)).status,404);
+    const left=next(bob,"user_left");alice.disconnect();assert.match((await left).message,/Alice/);
+    assert.equal((await download(last,a.token)).status,401);
+  });
 });
-const join = (s, name, room) => new Promise(res => s.emit("join_room", { username: name, room }, res));
-const send = (s, msg, room, reply=null) => new Promise(res => s.emit("send_message", { message: msg, room, reply }, res));
-
-console.log("🔌 Connecting clients...");
-const alice = await connect("alice");
-const bob = await connect("bob");
-
-console.log("🚪 Join room...");
-// Server broadcasts members_update to the WHOLE room (including the joiner) BEFORE
-// acking, so alice's own join fires members_update([alice]). Wait for the broadcast
-// that shows BOTH users — that's the one after bob joins.
-const bothMembersP = new Promise(res =>
-  alice.on("members_update", ({ members }) => {
-    if (members.length === 2 && members.some(m=>m.username==="alice") && members.some(m=>m.username==="bob")) res({ members });
-  })
-);
-const aJoin = await join(alice, "alice", ROOM);
-const bJoin = await join(bob, "bob", ROOM);
-ok(aJoin.ok && bJoin.ok, "both clients join room");
-
-const members = (await Promise.race([bothMembersP, new Promise(res => setTimeout(() => res({ members: [] }), 5000))])).members;
-ok(members.length === 2 && members.some(m=>m.username==="alice") && members.some(m=>m.username==="bob"), "members list shows both users");
-
-// E2E: alice sends ciphertext only server could not read
-const key = await deriveKey(ROOM);
-const plaintext = "hello from alice 🔐";
-const cipher = await encrypt(key, plaintext);
-ok(cipher !== plaintext && !cipher.includes(plaintext), "ciphertext does not leak plaintext");
-
-// bob receives + decrypts
-const recvP = new Promise(res => bob.once("receive_message", res));
-await send(alice, cipher, ROOM);
-const got = await recvP;
-const decrypted = await decrypt(key, got.message);
-ok(decrypted === plaintext, "bob decrypts alice's message exactly");
-ok(got.username === "alice", "server relays username in plaintext");
-
-// reply threading
-const replyP = new Promise(res => alice.once("receive_message", res));
-await send(bob, await encrypt(key, "replying!"), ROOM, { username: "alice", message: "hello from alice 🔐", isImage: false });
-const r = await replyP;
-ok(r.reply && r.reply.username === "alice", "reply metadata relayed");
-
-// image
-const imgP = new Promise(res => alice.once("receive_image", res));
-await bob.emit("send_image", { imageData: await encrypt(key, "data:image/png;base64,AAAA"), room: ROOM });
-const img = await imgP;
-ok(typeof img.imageData === "string" && img.imageData.length > 0, "image relayed as ciphertext");
-
-// typing
-const typeP = new Promise(res => alice.once("user_typing", res));
-bob.emit("typing_start", { room: ROOM });
-ok((await typeP).username === "bob", "typing indicator relayed");
-
-// bad room rejected
-const evil = await join(await connect("mallory"), "mallory", "not a valid room code!!!");
-ok(evil.ok === false, "invalid room code rejected");
-
-// clear chat
-const clearP = new Promise(res => bob.once("chat_cleared", res));
-await new Promise(res => alice.emit("clear_chat", { room: ROOM }, res));
-ok((await clearP).clearedBy === "alice", "clear_chat broadcast with clearedBy");
-
-// leave — bob must still be connected to receive the broadcast; alice leaving is
-// what triggers it, so race the wait instead of hanging if the server is down.
-const leftP = new Promise(res => bob.once("user_left", res));
-alice.disconnect();
-ok((await Promise.race([leftP, new Promise(res => setTimeout(() => res({ message: "" }), 5000))])).message.includes("alice"), "leave notice broadcast");
-
-console.log(`\n📊 ${pass} passed, ${fail} failed`);
-bob.disconnect();
-process.exit(fail ? 1 : 0);

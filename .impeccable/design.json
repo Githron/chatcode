@@ -1,0 +1,329 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-20T14:52:09.517901+00:00",
+  "title": "ChatCode design system",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Charcoal canvas",
+        "canonical": "#181818",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "canvas-elev": {
+        "role": "neutral",
+        "displayName": "Raised charcoal",
+        "canonical": "#303030",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "White",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "body": {
+        "role": "neutral",
+        "displayName": "Body gray",
+        "canonical": "#969696",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted gray",
+        "canonical": "#666666",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "muted-soft": {
+        "role": "neutral",
+        "displayName": "Field-label gray",
+        "canonical": "#8f8f8f",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "rosso": {
+        "role": "primary",
+        "displayName": "Rosso Corsa",
+        "canonical": "#da291c",
+        "tonalRamp": [
+          "oklch(15% 0.0438 29.6)",
+          "oklch(26% 0.1130 29.6)",
+          "oklch(38% 0.1838 29.6)",
+          "oklch(49% 0.2124 29.6)",
+          "oklch(61% 0.1882 29.6)",
+          "oklch(72% 0.1262 29.6)",
+          "oklch(84% 0.0494 29.6)",
+          "oklch(95% 0.0052 29.6)"
+        ]
+      },
+      "rosso-active": {
+        "role": "primary",
+        "displayName": "Active red",
+        "canonical": "#b01e0a",
+        "tonalRamp": [
+          "oklch(15% 0.0377 31.0)",
+          "oklch(26% 0.0971 31.0)",
+          "oklch(38% 0.1580 31.0)",
+          "oklch(49% 0.1826 31.0)",
+          "oklch(61% 0.1618 31.0)",
+          "oklch(72% 0.1085 31.0)",
+          "oklch(84% 0.0424 31.0)",
+          "oklch(95% 0.0045 31.0)"
+        ]
+      },
+      "hairline": {
+        "role": "neutral",
+        "displayName": "Charcoal hairline",
+        "canonical": "#303030",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.0)",
+          "oklch(26% 0.0000 0.0)",
+          "oklch(38% 0.0000 0.0)",
+          "oklch(49% 0.0000 0.0)",
+          "oklch(61% 0.0000 0.0)",
+          "oklch(72% 0.0000 0.0)",
+          "oklch(84% 0.0000 0.0)",
+          "oklch(95% 0.0000 0.0)"
+        ]
+      },
+      "yellow": {
+        "role": "secondary",
+        "displayName": "Focus yellow",
+        "canonical": "#fff200",
+        "tonalRamp": [
+          "oklch(15% 0.0413 105.7)",
+          "oklch(26% 0.1065 105.7)",
+          "oklch(38% 0.1732 105.7)",
+          "oklch(49% 0.2002 105.7)",
+          "oklch(61% 0.1774 105.7)",
+          "oklch(72% 0.1190 105.7)",
+          "oklch(84% 0.0465 105.7)",
+          "oklch(95% 0.0049 105.7)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Join-screen wordmark at desktop width."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Compact sidebar wordmark."
+      },
+      "room-code": {
+        "displayName": "Room Code",
+        "purpose": "Room code in the membership sidebar."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Conversation text and join instructions."
+      },
+      "action": {
+        "displayName": "Action",
+        "purpose": "Connect and Send."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Uppercase field and section labels."
+      },
+      "author": {
+        "displayName": "Author",
+        "purpose": "Uppercase message author."
+      },
+      "time": {
+        "displayName": "Time",
+        "purpose": "Message timestamp."
+      }
+    },
+    "breakpoints": [
+      {
+        "name": "Compact wordmark",
+        "value": "1024px"
+      },
+      {
+        "name": "Room drawer",
+        "value": "640px"
+      }
+    ],
+    "shadows": [
+      {
+        "name": "Field focus ring",
+        "value": "0 0 0 2px rgba(218,41,28,0.25)",
+        "purpose": "Highlights the active join or composer text field."
+      }
+    ],
+    "motion": [
+      {
+        "name": "Join entry",
+        "value": "0.6s cubic-bezier(.16,1,.3,1)",
+        "purpose": "Fade in and rise 24px."
+      },
+      {
+        "name": "Message entry",
+        "value": "0.2s ease",
+        "purpose": "Fade in and rise 8px."
+      },
+      {
+        "name": "Reply preview",
+        "value": "0.15s ease",
+        "purpose": "Fade in and rise 6px."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Connect",
+      "kind": "button",
+      "refersTo": "button-connect",
+      "description": "Connect action.",
+      "html": "<button type=\"button\" class=\"ds-button-connect\">Connect</button>",
+      "css": ".ds-button-connect { margin-top: var(--xxs, 8px);\n  width: 100%; height: 48px;\n  padding: 14px 32px;\n  background: var(--rosso, #da291c); color: var(--ink, #ffffff);\n  border: none; border-radius: 0;   \n  font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); font-size: 14px; font-weight: 700;\n  letter-spacing: 1.4px; text-transform: uppercase; line-height: 1;\n  cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;\n  transition: background 0.2s;  }\n.ds-button-connect:hover { background: var(--rosso-active, #b01e0a); }\n.ds-button-connect:active { background: var(--rosso-active, #b01e0a); }\n.ds-button-connect:disabled { opacity: 0.5; cursor: not-allowed; }\n.ds-button-connect:focus-visible { outline:2px solid var(--yellow, #fff200); outline-offset:2px; }"
+    },
+    {
+      "name": "Send",
+      "kind": "button",
+      "refersTo": "button-send",
+      "description": "Send action.",
+      "html": "<button type=\"button\" class=\"ds-button-send\">Send</button>",
+      "css": ".ds-button-send { height: 48px; flex-shrink: 0;\n  padding: 14px 32px;\n  background: var(--rosso, #da291c); color: var(--ink, #ffffff);\n  border: none; border-radius: 0;\n  font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); font-size: 14px; font-weight: 700;\n  letter-spacing: 1.4px; text-transform: uppercase; line-height: 1;\n  cursor: pointer; transition: background 0.2s;  }\n.ds-button-send:hover { background: var(--rosso-active, #b01e0a); }\n.ds-button-send:active { background: var(--rosso-active, #b01e0a); }\n.ds-button-send:focus-visible { outline:2px solid var(--yellow, #fff200); outline-offset:2px; }"
+    },
+    {
+      "name": "Clear chat",
+      "kind": "button",
+      "refersTo": "button-clear",
+      "description": "Clear chat action.",
+      "html": "<button type=\"button\" class=\"ds-button-clear\">🗑 Clear</button>",
+      "css": ".ds-button-clear { background: transparent; border: 1px solid var(--hairline, #303030); border-radius: 0;\n  color: var(--body, #969696); font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); font-size: 11px; font-weight: 600;\n  letter-spacing: 1.1px; text-transform: uppercase;\n  padding: 6px 12px; cursor: pointer; transition: border-color 0.2s, color 0.2s;  }\n.ds-button-clear:hover { border-color: var(--rosso, #da291c); color: var(--rosso, #da291c); }\n.ds-button-clear:focus-visible { outline:2px solid var(--yellow, #fff200); outline-offset:2px; }"
+    },
+    {
+      "name": "Leave room",
+      "kind": "button",
+      "refersTo": "button-leave",
+      "description": "Leave room action.",
+      "html": "<button type=\"button\" class=\"ds-button-leave\">← Leave Room</button>",
+      "css": ".ds-button-leave { margin-top: auto;\n  background: transparent; border: 1px solid var(--hairline, #303030);\n  border-radius: 0; color: var(--body, #969696);\n  font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); font-size: 12px; font-weight: 600;\n  letter-spacing: 0.65px; text-transform: uppercase;\n  padding: 10px; cursor: pointer;\n  transition: border-color 0.2s, color 0.2s;  }\n.ds-button-leave:hover { border-color: var(--rosso, #da291c); color: var(--rosso, #da291c); }\n.ds-button-leave:focus-visible { outline:2px solid var(--yellow, #fff200); outline-offset:2px; }"
+    },
+    {
+      "name": "Share image",
+      "kind": "button",
+      "refersTo": "button-image",
+      "description": "Attachment control in the composer.",
+      "html": "<button type=\"button\" aria-label=\"Send image\" class=\"ds-button-image\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\">\n              <rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><circle cx=\"8.5\" cy=\"8.5\" r=\"1.5\"/>\n              <path d=\"M21 15l-5-5L5 21\"/>\n            </svg></button>",
+      "css": ".ds-button-image { width: 48px; height: 48px; flex-shrink: 0;\n  background: var(--canvas, #181818); color: var(--body, #969696);\n  border: 1px solid var(--hairline, #303030); border-radius: 0;\n  cursor: pointer; display: flex; align-items: center; justify-content: center;\n  transition: border-color 0.2s, color 0.2s;  }\n.ds-button-image:hover { border-color: var(--rosso, #da291c); color: var(--rosso, #da291c); }\n.ds-button-image:focus-visible { outline:2px solid var(--yellow, #fff200); outline-offset:2px; }"
+    },
+    {
+      "name": "Room code field",
+      "kind": "input",
+      "refersTo": "text-field",
+      "description": "Room code entry.",
+      "html": "<input class=\"ds-text-field\" aria-label=\"Room code\" placeholder=\"e.g. ferrari-f1\">",
+      "css": ".ds-text-field { background: var(--canvas, #181818);\n  border: 1px solid var(--hairline, #303030);\n  border-radius: 4px;               \n  padding: 14px 16px; height: 48px;\n  color: var(--ink, #ffffff); font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); font-size: 14px;\n  outline: none;\n  transition: border-color 0.2s, box-shadow 0.2s;  }\n.ds-text-field:focus { border-color: var(--rosso, #da291c);\n  box-shadow: 0 0 0 2px rgba(218, 41, 28, 0.25); }\n.ds-text-field::placeholder { color: var(--muted, #666666); }"
+    },
+    {
+      "name": "Current member badge",
+      "kind": "chip",
+      "refersTo": "member-tag",
+      "description": "Identifies the current participant.",
+      "html": "<span class=\"ds-member-tag\">You</span>",
+      "css": ".ds-member-tag { font-size: 9px; font-weight: 600; letter-spacing: 1.1px; text-transform: uppercase;\n  color: var(--ink, #ffffff); background: var(--rosso, #da291c);\n  border-radius: 9999px;            \n  padding: 2px 8px; flex-shrink: 0; font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); }"
+    },
+    {
+      "name": "Room information",
+      "kind": "card",
+      "refersTo": "room-info",
+      "description": "Room code and current participant count.",
+      "html": "<div class=\"ds-room-info\"><span class=\"ds-room-label\">Room</span><span class=\"ds-room-code\">ferrari-f1</span><span class=\"ds-room-online\"><i class=\"ds-online-dot\"></i>2 online</span></div>",
+      "css": ".ds-room-info { background: var(--canvas-elev, #303030);\n  border: 1px solid var(--hairline, #303030);\n  border-radius: 0;                 \n  padding: var(--xs, 16px);\n  display: flex; flex-direction: column; gap: var(--xxs, 8px); font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); }\n.ds-room-label {font-size: 11px; font-weight: 600; letter-spacing: 1.1px;\n  text-transform: uppercase; color: var(--muted, #666666);}\n.ds-room-code {color: var(--rosso, #da291c); font-size: 16px; font-weight: 500;\n  word-break: break-all; line-height: 1.4;}\n.ds-room-online {display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--body, #969696);}\n.ds-online-dot {width: 7px; height: 7px; border-radius: 50%;\n  background: var(--rosso, #da291c);\n  animation: pulse 2s infinite;}"
+    },
+    {
+      "name": "Self message",
+      "kind": "custom",
+      "refersTo": "message-self",
+      "description": "The outgoing message surface.",
+      "html": "<div class=\"ds-message-self\">I’m in.</div>",
+      "css": ".ds-message-self { padding: 10px 14px; border-radius: 0; line-height: 1.5;\n  word-break: break-word; font-size: 14px; background: var(--rosso, #da291c); color: var(--ink, #ffffff); font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); width:fit-content; }"
+    },
+    {
+      "name": "Other message",
+      "kind": "custom",
+      "refersTo": "message-other",
+      "description": "The incoming message surface.",
+      "html": "<div class=\"ds-message-other\">See you in the room.</div>",
+      "css": ".ds-message-other { padding: 10px 14px; border-radius: 0; line-height: 1.5;\n  word-break: break-word; font-size: 14px; background: var(--canvas-elev, #303030); border: 1px solid var(--hairline, #303030); color: var(--ink, #ffffff); font-family: var(--font, 'Inter', -apple-system, system-ui, sans-serif); width:fit-content; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "",
+    "overview": "The join screen centers a bracketed wordmark and two fields against a charcoal backdrop. In the room, the same wordmark moves into the sidebar and the conversation gets the available space. Red connects the room code, the sender’s own messages, and the action that sends the next one.",
+    "keyCharacteristics": [
+      "A white CHAT and red CODE sit between muted brackets.",
+      "Square message bubbles distinguish authors by both position and fill.",
+      "Compact uppercase labels sit beside mixed-case conversation text."
+    ],
+    "rules": [],
+    "dos": [
+      "Pair outgoing red with right alignment and incoming charcoal with left alignment.",
+      "Keep author names and timestamps outside the message bubble.",
+      "Use the sidebar for room membership and keep message entry in the bottom bar."
+    ],
+    "donts": [
+      "Avoid pill-shaped message bubbles and primary buttons.",
+      "Avoid decorative shadows on panels or messages.",
+      "Reserve yellow for keyboard focus."
+    ]
+  }
+}
