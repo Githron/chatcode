@@ -1,5 +1,5 @@
 export const fileLimit = 10 * 1024 * 1024;
-export const formats = /\.(png|jpe?g|webp|pdf|docx|xlsx|pptx|txt|md|csv)$/i;
+export const formats = /\.(png|jpe?g|webp|gif|zip|pdf|docx|xlsx|pptx|txt|md|csv)$/i;
 export const sizeLabel = bytes => bytes < 1024 ? bytes+" B" : bytes < 1048576 ? Math.ceil(bytes/1024)+" KiB" : (bytes/1048576).toFixed(1)+" MiB";
 
 export async function roomKey(code) {
@@ -53,6 +53,6 @@ export async function upload(file,key,token,signal,progress) {
 }
 export async function fetchFile(file,key,token,signal) {
   const res=await fetch("/api/files/"+encodeURIComponent(file.id),{headers:{Authorization:"Bearer "+token},cache:"no-store",signal});
-  if (!res.ok) throw new Error(res.status===404 ? "This file has expired or was cleared." : "Download failed. Reconnect and try again.");
+  if (!res.ok) throw new Error(res.status===404 ? "This file is no longer in room history." : "Download failed. Reconnect and try again.");
   return new Blob([await unseal(key,new Uint8Array(await res.arrayBuffer()))],{type:file.type});
 }

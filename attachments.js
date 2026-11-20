@@ -11,7 +11,7 @@ const envelopeLimit = FILE_LIMIT + 28;
 const files = new Map();
 const inflight = new Set();
 const allowed = {
-  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp",
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", zip: "application/zip",
   pdf: "application/pdf", txt: "text/plain", md: "text/markdown", csv: "text/csv",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -20,7 +20,7 @@ const allowed = {
 const office = { docx: "word/document.xml", xlsx: "xl/workbook.xml", pptx: "ppt/presentation.xml" };
 const invalid = () => new Error("The file contents do not match a supported format.");
 
-function checkOffice(data, mainPart) {
+function checkArchive(data, mainPart) {
   return new Promise((resolve, reject) => {
     yauzl.fromBuffer(data, { lazyEntries: true }, (error, zip) => {
       if (error) return reject(invalid());
@@ -37,12 +37,35 @@ function checkOffice(data, mainPart) {
       });
       zip.once("end", () => {
         zip.close();
-        if (names.has("[Content_Types].xml") && names.has("_rels/.rels") && names.has(mainPart)) resolve();
+        if (names.size && (!mainPart || (names.has("[Content_Types].xml") && names.has("_rels/.rels") && names.has(mainPart)))) resolve();
         else reject(invalid());
       });
       zip.readEntry();
     });
   });
+}
+
+// Accept single-frame GIFs. Skip length-prefixed data blocks without expanding pixels.
+function checkGif(data) {
+  if(data.length < 14) throw invalid();
+  let pos=13, frames=0;
+  const tableSize=packed=>(packed & 128) ? 3*(2 << (packed & 7)) : 0;
+  pos+=tableSize(data[10]);
+  while(pos<data.length){
+    const block=data[pos++];
+    if(block===0x3b && frames===1 && pos===data.length)return;
+    if(block===0x21)pos++;
+    else if(block===0x2c){
+      if(++frames>1 || pos+9>data.length)throw invalid();
+      const width=data.readUInt16LE(pos+4), height=data.readUInt16LE(pos+6);
+      if(!width || !height || data.readUInt16LE(pos)+width>data.readUInt16LE(6) ||
+          data.readUInt16LE(pos+2)+height>data.readUInt16LE(8))throw invalid();
+      pos+=9+tableSize(data[pos+8])+1;
+    }else throw invalid();
+    while(pos<data.length && data[pos])pos+=1+data[pos];
+    pos++;
+  }
+  throw invalid();
 }
 
 async function validate(data, ext) {
@@ -51,10 +74,12 @@ async function validate(data, ext) {
     try { image = imageSize(data); } catch { throw invalid(); }
     if (image.type !== (ext === "jpeg" ? "jpg" : ext) || !image.width || !image.height ||
         image.width * image.height > 32_000_000) throw invalid();
+    if (ext==="gif")checkGif(data);
+    return {width:image.width,height:image.height};
   } else if (ext === "pdf") {
     if (!data.subarray(0, 5).equals(Buffer.from("%PDF-")) || !data.subarray(-1024).includes("%%EOF")) throw invalid();
-  } else if (office[ext]) {
-    await checkOffice(data, office[ext]);
+  } else if (office[ext] || ext==="zip") {
+    await checkArchive(data, office[ext]);
   } else {
     let text;
     try { text = new TextDecoder("utf-8", { fatal: true }).decode(data); } catch { throw invalid(); }
@@ -81,15 +106,15 @@ function hasSpace(room, size) {
   return files.size < 2048 && count < 256 && total + size <= 128 * MiB && local + size <= 40 * MiB;
 }
 
-export function publishFile(id, peer) {
+export function stagedFile(id, peer) {
   const file = files.get(id);
   if (!file || file.expires <= Date.now() || file.room !== peer.room || file.owner !== peer.token || file.published) return null;
-  file.published = true;
-  file.expires = Date.now() + 3600_000;
-  return file.info;
+  return file;
 }
 
-export function attachmentRoutes(app, sessions) {
+export function releaseFile(id) { files.delete(id); }
+
+export function attachmentRoutes(app, sessions, storage) {
   app.use("/api/files", (req, res, next) => {
     res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
     const peer = sessions.get((req.get("Authorization") || "").replace(/^Bearer /, ""));
@@ -122,12 +147,12 @@ export function attachmentRoutes(app, sessions) {
       const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
       decipher.setAuthTag(bytes.subarray(-16));
       plaintext = Buffer.concat([decipher.update(bytes.subarray(12, -16)), decipher.final()]);
-      await validate(plaintext, ext);
+      const dimensions=await validate(plaintext, ext);
       if (req.destroyed && !req.complete || res.destroyed || sessions.get(peer.token) !== peer || peer.state.generation !== generation)
         return res.status(409).json({ error: "The room changed. Choose the file again." });
       if (!hasSpace(peer.room, bytes.length)) return res.status(429).json({ error: "Room file storage is full." });
       const id = randomUUID();
-      const info = { id, name, type: allowed[ext], size: plaintext.length };
+      const info = { id, name, type: allowed[ext], size: plaintext.length, ...dimensions };
       files.set(id, { info, bytes, owner: peer.token, room: peer.room, published: false, expires: Date.now() + 120_000 });
       res.status(201).json(info);
     } catch {
@@ -135,11 +160,14 @@ export function attachmentRoutes(app, sessions) {
     } finally { plaintext?.fill(0); key?.fill(0); }
   });
 
-  app.get("/api/files/:id", (req, res) => {
-    const f = files.get(req.params.id);
-    if (!f || f.room !== req.peer.room || !f.published || f.expires <= Date.now())
-      return res.status(404).json({ error: "This file is unavailable or has expired." });
-    res.set("Content-Disposition", "attachment").type("application/octet-stream").send(f.bytes);
+  app.get("/api/files/:id", async (req, res) => {
+    const unavailable=()=>res.status(404).json({error:"This file is no longer in room history."});
+    if(!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id))return unavailable();
+    try {
+      const bytes=await storage.readFile(req.peer.room,req.params.id);
+      if(!bytes || sessions.get(req.peer.token)!==req.peer)return unavailable();
+      res.set("Content-Disposition","attachment").type("application/octet-stream").send(bytes);
+    } catch {res.status(503).json({error:"File storage is unavailable. Please retry."});}
   });
   app.use("/api/files", (err, req, res, next) => {
     if (res.headersSent) return next(err);

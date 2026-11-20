@@ -3,9 +3,11 @@ services:
     name: chatcode
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci
     startCommand: node server.js
     healthCheckPath: /ping
     envVars:
       - key: NODE_ENV
         value: production
+      - key: DATABASE_URL
+        sync: false

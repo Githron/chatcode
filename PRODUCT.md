@@ -16,13 +16,13 @@ Help someone go from receiving a code to exchanging a first message with the peo
 
 ## Operating Context
 
-Participants arrange to use the same code before meeting in ChatCode. Inside the room, they can exchange text, images, PDFs, Office documents, and text files, reply to a specific message, see who is typing, and leave when the conversation is over. A room member can also clear the conversation for everyone currently in that room.
+Participants arrange to use the same code before meeting in ChatCode. Inside the room, they can exchange text, images, PDFs, ZIP archives, Office documents, and text files, reply to a specific message, see who is typing, and leave when the conversation is over. On entry, participants see the latest 100 messages, including shared files and reply excerpts. Any room member can explicitly confirm permanent deletion of the shared conversation.
 
 ## Privacy and Room Access
 
 Anyone with the room code can join under a chosen username. A username identifies a participant within the conversation and carries no identity verification.
 
-The browser encrypts message and attachment contents before sending them. It derives the encryption key from the shared room code. The server receives that code when participants join, so it has the information needed to derive the same key. The server uses that key to validate uploaded file contents, then holds the encrypted attachment in temporary memory. A connected room member can download a published attachment until expiry, a room clear, or the last member leaving.
+The browser encrypts message and attachment contents before sending them. It derives the encryption key from the shared room code. The server receives that code when participants join, so it has the information needed to derive the same key. The server uses that key to validate uploaded file contents, then stores the original encrypted attachment with the saved message. Connected members can download it while its message is retained. Leaving a room does not erase history.
 
 ## Product Principles
 

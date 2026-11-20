@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="theme-color" content="#191a1b"><title>ChatCode — Room messenger</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23ed4436'/%3E%3Cpath d='M7 9h18v11H13l-6 5z' fill='%23191a1b'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/style.css">
@@ -54,6 +54,7 @@
   <button type="button" id="backdrop" aria-label="Close room details" tabindex="-1" hidden></button>
   <main class="chat-main" id="main-room">
     <header class="chat-header"><div class="channel-mark"><svg class="icon" aria-hidden="true"><use href="#i-hash"></use></svg></div><div class="header-title"><h1 id="header-room"></h1><span id="network" role="status"></span></div><button id="menu-toggle" class="icon-button mobile" aria-controls="sidebar" aria-expanded="false" aria-label="Room members and settings"><svg class="icon" aria-hidden="true"><use href="#i-people"></use></svg></button></header>
+    <p id="history-status" class="history-status" role="status" hidden>Loading room history…</p>
     <div id="history" class="history" tabindex="0" aria-label="Conversation history">
       <div id="empty" class="empty"><span class="empty-mark"><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg></span><h2>Start the conversation<span class="stop">.</span></h2><p>Send a message or share a file with this room.</p></div>
       <div id="messages" role="log" aria-label="Messages" aria-live="polite" aria-relevant="additions"></div>
@@ -63,14 +64,14 @@
       <div id="typing" class="typing"></div>
       <form id="composer"><div id="reply-preview" class="tray" hidden><svg class="icon" aria-hidden="true"><use href="#i-reply"></use></svg><span></span><button type="button" id="reply-cancel" class="icon-button" aria-label="Cancel reply"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button></div>
         <div id="file-tray" class="tray" hidden><span id="file-thumb"></span><span id="file-detail"></span><button id="remove-file" type="button" class="icon-button" aria-label="Remove attachment"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button></div>
-        <div class="compose-row"><button id="attach" type="button" class="icon-button" title="Attach a file" aria-label="Attach a file"><svg class="icon" aria-hidden="true"><use href="#i-clip"></use></svg></button><input type="file" id="file-input" hidden accept=".png,.jpg,.jpeg,.webp,.pdf,.docx,.xlsx,.pptx,.txt,.md,.csv"><textarea id="message-input" rows="1" maxlength="500" aria-label="Message" placeholder="Write a message…"></textarea><button id="send-btn" type="submit" class="primary" disabled aria-label="Send message"><span>Send</span><svg class="icon" aria-hidden="true"><use href="#i-send"></use></svg></button></div>
+        <div class="compose-row"><button id="attach" type="button" class="icon-button" title="Attach a file" aria-label="Attach a file"><svg class="icon" aria-hidden="true"><use href="#i-clip"></use></svg></button><input type="file" id="file-input" hidden accept=".png,.jpg,.jpeg,.webp,.gif,.zip,.pdf,.docx,.xlsx,.pptx,.txt,.md,.csv"><textarea id="message-input" rows="1" maxlength="500" aria-label="Message" placeholder="Write a message…"></textarea><button id="send-btn" type="submit" class="primary" disabled aria-label="Send message"><span>Send</span><svg class="icon" aria-hidden="true"><use href="#i-send"></use></svg></button></div>
         <div id="transfer" hidden><progress max="100" value="0" aria-label="Attachment upload progress"></progress><span id="transfer-label" role="status"></span></div>
       </form>
-      <p id="send-error" class="error" role="alert"></p><div class="compose-note"><span>Images, PDF, Office &amp; text · 10 MiB</span><span class="shortcut">Enter to send</span></div>
+      <p id="send-error" class="error" role="alert"></p><div class="compose-note"><span>Images, PDF, Office, ZIP &amp; text · 10 MiB</span><span class="shortcut">Enter to send</span></div>
     </div>
   </main>
 </div>
-<dialog id="viewer"><header><strong id="viewer-name"></strong><button class="icon-button" id="close-viewer" aria-label="Close image"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button></header><img id="full-image" alt=""></dialog>
+<dialog id="viewer" aria-labelledby="viewer-name"><header><strong id="viewer-name"></strong><button id="viewer-zoom" type="button" aria-pressed="false">Zoom in</button><a id="viewer-download">Download</a><button class="icon-button" id="close-viewer" aria-label="Close image"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button></header><p id="viewer-status" role="status"></p><div class="image-stage"><img id="full-image" alt=""></div></dialog>
 <p id="notice" class="notice" role="status"></p>
 <script src="/socket.io/socket.io.js"></script><script src="/script.js" type="module"></script>
 </body></html>
