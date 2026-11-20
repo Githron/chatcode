@@ -47,6 +47,9 @@ async function establish(name,code){
   key=newKey;
   const result=await emit("join_room",{username:name,room:code});
   if(version!==connectionVersion) throw new Error("Connection changed. Please try again.");
+  if(typeof result.token !== "string" || !result.token) {
+    throw new Error("This server is running an older ChatCode version. Restart the server, then reload this page.");
+  }
   username=name;room=code;token=result.token;
   $("header-room").textContent=$("room-display").textContent=room;
   $("network").textContent="Connected"; $("wake-status").textContent="";
