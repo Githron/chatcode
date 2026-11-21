@@ -223,4 +223,17 @@ test("music storage migration and lifecycle", async t => {
       for (const statement of report.split(";").filter(s=>s.trim())) await db.query(statement);
     });
   });
+
+  await t.test("revocation during publication rolls back the claim and a retry preserves the original envelope",async()=>{
+    await start();
+    const id=randomUUID(), code="interrupted-music", first=Buffer.alloc(track.sizeBytes+28,1);
+    let checks=0;
+    await assert.rejects(store.music.saveUpload(code,id,track,first,()=>++checks===1),/session ended/);
+    assert.equal(await store.music.readTrack(code,id),null);
+    assert.equal((await store.music.snapshot(code)).revision,"0");
+    await start();
+    await store.music.saveUpload(code,id,track,Buffer.alloc(first.length,2),()=>true);
+    assert.deepEqual(await store.music.readTrack(code,id),first);
+    assert.equal((await store.music.snapshot(code)).revision,"1");
+  });
 });

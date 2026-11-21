@@ -1,16 +1,17 @@
 import express from "express";
-import { randomUUID, pbkdf2, createDecipheriv } from "node:crypto";
+import { randomUUID, pbkdf2, createDecipheriv, createHmac } from "node:crypto";
 import { promisify } from "node:util";
 import yauzl from "yauzl";
 import { imageSize } from "image-size";
 import { fileLimit, uploadLimit } from "./public/transfer.js";
 import { validateVideo } from "./video-container.js";
+import { mp3Duration } from "./mp3.js";
 
 const derive = promisify(pbkdf2);
 const MiB = 1024 * 1024;
 const envelopeLimit = fileLimit + 28;
 const files = new Map();
-const inflight = new Set();
+const inflight = new Map();
 const allowed = {
   mp4: "video/mp4", webm: "video/webm",
   jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", zip: "application/zip",
@@ -120,7 +121,10 @@ export function releaseFile(id) { files.delete(id); }
 
 export function attachmentRoutes(app, sessions, storage) {
   let recentUploads = [];
-  app.use("/api/files", (req, res, next) => {
+  const musicPath="/api/music/tracks";
+  const uploadPaths=storage.music ? ["/api/files",musicPath] : ["/api/files"];
+  if (storage.music) app.use(musicPath,(req,res,next)=>{req.musicUpload=true; next();});
+  app.use(uploadPaths, (req, res, next) => {
     res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
     const peer = sessions.get((req.get("Authorization") || "").replace(/^Bearer /, ""));
     if (!peer || req.get("Authorization") !== "Bearer " + peer.token) return res.status(401).json({ error: "Join the room again to access files." });
@@ -128,13 +132,14 @@ export function attachmentRoutes(app, sessions, storage) {
     next();
   });
 
-  app.post("/api/files", async (req, res, next) => {
+  app.post(uploadPaths, async (req, res, next) => {
     const size = Number(req.get("Content-Length"));
     const { token, room } = req.peer;
     let name;
     try { name = decodeURIComponent(req.get("X-File-Name") || "").normalize("NFC"); } catch { name = ""; }
     const ext = name.split(".").pop().toLowerCase();
-    if (!name.includes(".") || !Object.hasOwn(allowed, ext) || name.length > 160 || /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(name) || name.startsWith("."))
+    const supported=req.musicUpload ? ext==="mp3" : Object.hasOwn(allowed,ext);
+    if (!name.includes(".") || !supported || name.length > 160 || /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(name) || name.startsWith("."))
       return res.status(415).json({error:"Choose a supported file with a safe filename."});
     if (!Number.isSafeInteger(size) || size <= 28 || size > uploadLimit(name)+28 || !req.is("application/octet-stream") || req.get("Content-Encoding"))
       return res.status(413).json({ error: "Choose a nonempty image up to 8 MB or another supported file up to 10 MiB." });
@@ -146,13 +151,16 @@ export function attachmentRoutes(app, sessions, storage) {
     recentUploads.push({time:now,token});
     req.fileName = name;
     req.fileGeneration = req.peer.state.generation;
-    inflight.add(token);
-    res.once("close", () => inflight.delete(token));
-    try { await storage.checkUploadSpace(room,size); }
+    inflight.set(token,req);
+    res.once("close", () => {if (!req.checkingFile && inflight.get(token)===req) inflight.delete(token);});
+    // A published music retry can succeed at a full quota; reserve after deriving its identity.
+    try { if (!req.musicUpload) await storage.checkUploadSpace(room,size); }
     catch (err) { return res.status(err.publicMessage ? 507 : 503).json({error:err.publicMessage || "Storage is unavailable. Please retry."}); }
     next();
   }, express.raw({ type: "application/octet-stream", limit: envelopeLimit, inflate: false }), async (req, res) => {
     const peer = req.peer;
+    req.checkingFile=true;
+    const stillJoined=()=>!res.destroyed && sessions.get(peer.token)===peer;
     const generation = req.fileGeneration;
     let plaintext;
     let key;
@@ -164,6 +172,23 @@ export function attachmentRoutes(app, sessions, storage) {
       const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
       decipher.setAuthTag(bytes.subarray(-16));
       plaintext = Buffer.concat([decipher.update(bytes.subarray(12, -16)), decipher.final()]);
+      if (req.musicUpload) {
+        const durationMs=mp3Duration(plaintext);
+        const sizeBytes=plaintext.length;
+        // The room key scopes deduplication. Retrying with a fresh IV retains the first envelope.
+        const hex=createHmac("sha256",key).update("chatcode-mp3-v1\0").update(name).update("\0").update(plaintext).digest("hex");
+        const id=[hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20,32)].join("-");
+        plaintext.fill(0); key.fill(0);
+        if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
+        try {
+          const created=await storage.music.saveUpload(peer.room,id,{filename:name,sizeBytes,durationMs},bytes,stillJoined);
+          if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
+          return res.status(created?201:200).json({id,name,type:"audio/mpeg",size:sizeBytes,durationMs});
+        } catch (err) {
+          if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
+          return res.status(err.publicMessage?507:503).json({error:err.publicMessage || "Music storage is unavailable. Retry the upload."});
+        }
+      }
       const dimensions=await validate(plaintext, ext);
       if (req.destroyed && !req.complete || res.destroyed || sessions.get(peer.token) !== peer || peer.state.generation !== generation)
         return res.status(409).json({ error: "The room changed. Choose the file again." });
@@ -174,7 +199,10 @@ export function attachmentRoutes(app, sessions, storage) {
       res.status(201).json(info);
     } catch {
       res.status(415).json({ error: "File validation failed. Check that the file is complete and matches its extension." });
-    } finally { plaintext?.fill(0); key?.fill(0); }
+    } finally {
+      plaintext?.fill(0); key?.fill(0);
+      if (inflight.get(peer.token)===req) inflight.delete(peer.token);
+    }
   });
 
   app.get("/api/files/:id", async (req, res) => {
@@ -186,7 +214,25 @@ export function attachmentRoutes(app, sessions, storage) {
       res.set("Content-Disposition","attachment").type("application/octet-stream").send(bytes);
     } catch {res.status(503).json({error:"File storage is unavailable. Please retry."});}
   });
-  app.use("/api/files", (err, req, res, next) => {
+  if (storage.music) {
+    const reads=new Set();
+    app.get(musicPath+"/:id",async (req,res)=>{
+      const {peer}=req;
+      if (!/^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(req.params.id))
+        return res.status(404).json({error:"Track unavailable."});
+      if (reads.size>=4 || reads.has(peer.token)) return res.status(429).json({error:"Music downloads are busy. Retry shortly."});
+      reads.add(peer.token);
+      try {
+        const bytes=await storage.music.readTrack(peer.room,req.params.id);
+        if (!bytes || sessions.get(peer.token)!==peer) return res.status(404).json({error:"Track unavailable."});
+        if (res.destroyed) return;
+        res.set("Content-Disposition","attachment").type("application/octet-stream").send(bytes);
+        if (!res.writableFinished && !res.destroyed) await new Promise(resolve=>res.once("close",resolve));
+      } catch {res.status(503).json({error:"Music storage is unavailable. Retry the download."});}
+      finally {reads.delete(peer.token);}
+    });
+  }
+  app.use(uploadPaths, (err, req, res, next) => {
     if (res.headersSent) return next(err);
     res.status(err.type === "entity.too.large" ? 413 : 400).json({ error: "Upload interrupted or too large." });
   });

@@ -9,7 +9,7 @@ import { openStorage } from "./storage.js";
 import { MediaConfigurationError } from "./media-storage.js";
 
 let storage;
-try {storage=await openStorage();}
+try {storage=await openStorage({enableMusicStorage:process.env.CHATCODE_MUSIC_UPLOADS==="1"});}
 catch (err) {console.error(err instanceof MediaConfigurationError ? err.message : "History storage could not start. Check the database configuration and permissions.");process.exit(1);}
 const app = express();
 app.disable("x-powered-by");

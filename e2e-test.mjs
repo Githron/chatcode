@@ -13,9 +13,29 @@ import { storageStep } from "./storage-diagnostics.js";
 import { S3Client } from "@aws-sdk/client-s3";
 import pg from "pg";
 import {validateVideo} from "./video-container.js";
+import {mp3Duration} from "./mp3.js";
 
 const mp4=await readFile(new URL("./test/fixtures/clip.mp4",import.meta.url));
 const webm=await readFile(new URL("./test/fixtures/clip.webm",import.meta.url));
+const mp3=await readFile(new URL("./test/fixtures/tone.mp3",import.meta.url));
+const mono=await readFile(new URL("./test/fixtures/mono.mp3",import.meta.url));
+
+test("MP3 duration is measured from bounded Layer III frames, including VBR and metadata",()=>{
+  assert.equal(mp3Duration(mp3),350);
+  assert.ok(mp3Duration(mono)>=250 && mp3Duration(mono)<350);
+  const xing=mp3.indexOf("Xing");
+  assert.ok(xing>0);
+  const badCount=Buffer.from(mp3);
+  badCount.writeUInt32BE(1,xing+8);
+  const badSide=Buffer.from(mp3);
+  badSide.fill(255,xing-32,xing);
+  const badTag=Buffer.from(mp3);
+  badTag[6]=0xff;
+  const truncatedFrame=mp3.subarray(0,mp3.length-1);
+  for (const bytes of [badCount,badSide,badTag,truncatedFrame,mp3.subarray(0,xing-36),
+    Buffer.concat([mp3,Buffer.from("junk")]),Buffer.alloc(fileLimit+1),webm,mp4])
+    assert.throws(()=>mp3Duration(bytes),/MP3/);
+});
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 const room = "test-"+randomUUID().slice(0,12);
@@ -94,7 +114,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
   const objects=pathJoin(directory,"objects");
   await mkdir(objects);
   const account="a".repeat(32);
-  let backend="database",budget=128*1024*1024,pgOptions="";
+  let backend="database",budget=128*1024*1024,pgOptions="",musicEnabled=false;
   let stderr="";
   const start=()=>{
     const child=spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
@@ -104,7 +124,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
       AWS_ACCESS_KEY_ID:"legacy-test",AWS_SECRET_ACCESS_KEY:"fixture",AWS_SESSION_TOKEN:"",
       R2_ACCOUNT_ID:backend==="r2"?account:"",R2_ENDPOINT:backend==="r2"?"https://"+account+".r2.cloudflarestorage.com":"",
       R2_BUCKET_NAME:backend==="r2"?"test-r2":"",R2_ACCESS_KEY_ID:backend==="r2"?"r2-test":"",R2_SECRET_ACCESS_KEY:backend==="r2"?"fixture":"",
-      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","pipe"]});
+      CHATCODE_MUSIC_UPLOADS:musicEnabled?"1":"",CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","pipe"]});
     child.stderr.on("data",chunk=>{stderr+=chunk;process.stderr.write(chunk);});
     return child;
   };
@@ -436,5 +456,91 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
       }
       assert.fail("Test object cleanup did not finish");
     } finally {await locker.end();}
+  });
+
+  await t.test("opt-in music uploads validate MP3s and retain one authorized encrypted track across retries and restarts",async()=>{
+    const path="/api/music/tracks", code="music-"+randomUUID().slice(0,8), key=await roomKey(code);
+    const post=(token,body,name="tone.mp3")=>fetch(url+path,{method:"POST",headers:{
+      ...auth(token),"Content-Type":"application/octet-stream","X-File-Name":encodeURIComponent(name)},body});
+    const get=(token,id)=>fetch(url+path+"/"+id,{headers:auth(token)});
+    const encrypted=await seal(key,mp3);
+    assert.equal((await post("",encrypted)).status,404);
+    musicEnabled=true;
+    backend="r2";
+    pgOptions="-c lock_timeout=500ms";
+    budget=encrypted.length;
+    await restart();
+    const writer=await connect(),reader=await connect(),outsider=await connect();
+    const w=await join(writer,"Writer",code), r=await join(reader,"Listener",code), x=await join(outsider,"Other",code+"-x");
+    assert.equal((await post("",encrypted)).status,401);
+    assert.equal((await post(x.token,encrypted)).status,415);
+    assert.equal((await post(w.token,encrypted,"../tone.mp3")).status,415);
+    assert.equal((await post(w.token,encrypted,"tone.mp4")).status,415);
+    assert.equal((await post(w.token,await seal(key,webm))).status,415);
+    assert.equal((await post(w.token,await seal(key,mp3.subarray(0,-1)))).status,415);
+    assert.equal((await post(w.token,Buffer.alloc(fileLimit+29))).status,413);
+    const tampered=encrypted.slice(); tampered[tampered.length-1]^=1;
+    assert.equal((await post(w.token,tampered)).status,415);
+    assert.deepEqual(await readdir(objects),[]);
+    const offline=pathJoin(objects,"offline");
+    await writeFile(offline,"");
+    assert.equal((await post(w.token,encrypted)).status,503);
+    await rm(offline);
+    const [original]=await readdir(objects);
+    assert.ok(original?.startsWith("r2-"));
+    assert.deepEqual(await readFile(pathJoin(objects,original)),Buffer.from(encrypted));
+    // Restart between an ambiguous PUT and publication, with precisely one track's quota.
+    await restart();
+    const a=await connect(), b=await connect(), c=await connect();
+    const u=await join(a,"Writer",code), v=await join(b,"Listener",code), outsider2=await join(c,"Other",code+"-x");
+    if (process.env.CHATCODE_TEST_DATABASE_URL) {
+      const locker=new pg.Client({connectionString:process.env.CHATCODE_TEST_DATABASE_URL});
+      await locker.connect();
+      try {
+        await locker.query("BEGIN");
+        await locker.query("LOCK TABLE chatcode_music_tracks IN SHARE MODE");
+        assert.equal((await post(u.token,encrypted)).status,503);
+      } finally {await locker.query("ROLLBACK"); await locker.end();}
+    }
+    const responses=await Promise.all([post(u.token,await seal(key,mp3)),post(v.token,await seal(key,mp3))]);
+    const tracks=[];
+    for (const res of responses) {
+      assert.ok([200,201].includes(res.status),String(res.status));
+      tracks.push(await res.json());
+    }
+    const track=tracks[0];
+    assert.deepEqual(tracks[1],track);
+    assert.deepEqual(track,{id:track.id,name:"tone.mp3",size:mp3.length,type:"audio/mpeg",durationMs:350});
+    assert.equal((await post(v.token,encrypted)).status,200);
+    assert.equal((await post(v.token,await seal(key,mono),"mono.mp3")).status,507);
+    assert.deepEqual(await readdir(objects),[original]);
+    assert.equal((await get("",track.id)).status,401);
+    assert.equal((await get(r.token,track.id)).status,401);
+    assert.equal((await get(outsider2.token,track.id)).status,404);
+    await writeFile(offline,"");
+    assert.equal((await get(u.token,track.id)).status,503);
+    await rm(offline);
+    assert.ok((await request(a,"clear_chat",{room:code,confirm:true})).ok);
+    await restart();
+    const again=await join(await connect(),"Listener",code);
+    const download=await get(again.token,track.id);
+    assert.equal(download.status,200);
+    assert.equal(download.headers.get("cache-control"),"no-store");
+    assert.equal(download.headers.get("content-type"),"application/octet-stream");
+    const bytes=new Uint8Array(await download.arrayBuffer());
+    assert.deepEqual(bytes,encrypted);
+    assert.deepEqual(Buffer.from(await unseal(key,bytes)),mp3);
+    // Grow the real ID3 padding, leaving the complete audio program intact.
+    const extra=fileLimit-mp3.length;
+    const oldSize=mp3.subarray(6,10).reduce((n,b)=>n*128+b,0);
+    const limit=Buffer.concat([mp3.subarray(0,10+oldSize),Buffer.alloc(extra),mp3.subarray(10+oldSize)]);
+    const tagSize=oldSize+extra;
+    for (let i=0;i<4;i++) limit[9-i]=(tagSize>>>(7*i))&127;
+    budget=128*1024*1024;
+    await restart();
+    const last=await join(await connect(),"Writer",code);
+    const accepted=await post(last.token,await seal(key,limit),"limit.mp3");
+    assert.equal(accepted.status,201);
+    assert.equal((await accepted.json()).size,fileLimit);
   });
 });

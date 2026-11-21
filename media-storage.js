@@ -33,16 +33,23 @@ export function mediaStorage(env = process.env) {
   function send(key, Command, extra, timeout) {
     const isR2 = key.startsWith("chatcode/r2/");
     const client = isR2 ? r2 : legacy;
-    return storageStep((isR2 ? "r2." : "s3.") + Command.name.replace(/Command$/, ""), () => {
+    return storageStep((isR2 ? "r2." : "s3.") + Command.name.replace(/Command$/, ""), async () => {
       if (!client) throw new Error("Private object storage unavailable.");
-      return client.send(new Command({
-        Bucket: isR2 ? r2Bucket : env.S3_BUCKET, Key: key, ...extra,
-      }), { abortSignal: AbortSignal.timeout(timeout) });
+      try {
+        return await client.send(new Command({
+          Bucket: isR2 ? r2Bucket : env.S3_BUCKET, Key: key, ...extra,
+        }), { abortSignal: AbortSignal.timeout(timeout) });
+      } catch (err) {
+        // A retry of a create-only PUT can find the original, already committed envelope.
+        if (extra.IfNoneMatch==="*" && err.name==="PreconditionFailed" && err.$metadata?.httpStatusCode===412) return;
+        throw err;
+      }
     });
   }
   return {
     newKey: () => r2 ? "chatcode/r2/" + randomUUID() : legacy ? "chatcode/" + randomUUID() : null,
     put: (key, bytes) => send(key, PutObjectCommand, { Body: bytes, ContentType: "application/octet-stream" }, 45000),
+    putOnce: (key, bytes) => send(key, PutObjectCommand, { Body: bytes, ContentType: "application/octet-stream", IfNoneMatch:"*" }, 45000),
     async get(key) {
       const result = await send(key, GetObjectCommand, {}, 30000);
       return Buffer.from(await result.Body.transformToByteArray());

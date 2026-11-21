@@ -45,7 +45,7 @@ export const musicMigration = [
 const stateFields = "revision::text, current_entry, position_ms, playing, anchor_time";
 const emptyState = {revision:"0", current_entry:null, position_ms:0, playing:false, anchor_time:null};
 
-// All callers are server-side. Room codes come from the authorized peer in a future transport layer.
+// Room codes come from the authorized peer. Reservation handles never leave the server.
 export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget}) {
   async function lockRoom(tx, room) {
     await tx.query("INSERT INTO chatcode_music_playback(room) VALUES ($1) ON CONFLICT DO NOTHING", [room]);
@@ -88,21 +88,28 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
     },
 
     // This private handle is for the R2 writer. Only publish after validation and a confirmed PUT.
-    async reserveTrack(code, size) {
+    async reserveTrack(code, size, trackId = randomUUID()) {
       if (!Number.isInteger(size) || size < 1 || size > maxTrackSize) throw new Error("Invalid track size.");
       const objectKey = media.newKey();
       if (!objectKey?.startsWith("chatcode/r2/")) throw new Error("Music requires private R2 storage.");
-      const room = roomId(code), trackId = randomUUID(), bytes = size + envelopeBytes;
-      await db.transaction(async tx => {
+      const room = roomId(code), bytes = size + envelopeBytes;
+      return db.transaction(async tx => {
         await lockBudget(tx);
+        const existing=await tx.query("SELECT 1 FROM chatcode_music_tracks WHERE room=$1 AND track_id=$2", [room,trackId]);
+        if (existing.rows.length) return {trackId, published:true};
+        const prior=await tx.query(`UPDATE chatcode_object_cleanup SET due=clock_timestamp()+interval '1 hour'
+          WHERE room=$1 AND music_upload_id=$2 AND byte_count=$3 AND due>clock_timestamp() RETURNING object_key`, [room,trackId,bytes]);
+        if (prior.rows.length) return {trackId, objectKey:prior.rows[0].object_key};
+        await tx.query(`UPDATE chatcode_object_cleanup SET music_upload_id=NULL
+          WHERE room=$1 AND music_upload_id=$2 AND due<=clock_timestamp()`,[room,trackId]);
         await checkSpace(tx, room, bytes);
         await tx.query(`INSERT INTO chatcode_object_cleanup(object_key, room, byte_count, music_upload_id, due)
           VALUES ($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`, [objectKey, room, bytes, trackId]);
+        return {trackId, objectKey};
       });
-      return {trackId, objectKey};
     },
 
-    async publishTrack(code, trackId, {filename, sizeBytes, durationMs}) {
+    async publishTrack(code, trackId, {filename, sizeBytes, durationMs}, expectedKey=null, stillJoined=()=>true) {
       if (typeof filename !== "string" || filename.startsWith(".") || filename.length > 160 ||
           !/\.mp3$/i.test(filename) || /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(filename))
         throw new Error("Invalid MP3 filename.");
@@ -120,14 +127,35 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
           return revision;
         }
         const claim = await tx.query(`DELETE FROM chatcode_object_cleanup
-          WHERE room=$1 AND music_upload_id=$2 AND due>clock_timestamp() RETURNING object_key, byte_count`, [room, trackId]);
+          WHERE room=$1 AND music_upload_id=$2 AND due>clock_timestamp() AND ($3::text IS NULL OR object_key=$3)
+          RETURNING object_key, byte_count`, [room, trackId, expectedKey]);
         if (!claim.rows.length) throw new Error("Music reservation unavailable.");
         const {object_key, byte_count} = claim.rows[0];
         if (byte_count !== sizeBytes + envelopeBytes) throw new Error("Track size differs from reservation.");
         await tx.query(`INSERT INTO chatcode_music_tracks(room,track_id,object_key,filename,size_bytes,duration_ms)
           VALUES ($1,$2,$3,$4,$5,$6)`, [room, trackId, object_key, filename, sizeBytes, durationMs]);
-        return advanceRevision(tx, room);
+        const nextRevision=await advanceRevision(tx,room);
+        if (!stillJoined()) throw new Error("Room session ended.");
+        return nextRevision;
       });
+    },
+
+    async saveUpload(code, id, metadata, encrypted, stillJoined) {
+      if (encrypted.length!==metadata.sizeBytes+envelopeBytes) throw new Error("Invalid track envelope size.");
+      const reservation=await this.reserveTrack(code,metadata.sizeBytes,id);
+      if (!stillJoined()) throw new Error("Room session ended.");
+      if (reservation.published) return false;
+      await media.putOnce(reservation.objectKey,encrypted);
+      await this.publishTrack(code,id,metadata,reservation.objectKey,stillJoined);
+      return true;
+    },
+
+    async readTrack(code,id) {
+      const {rows}=await db.query("SELECT object_key, byte_count FROM chatcode_music_tracks WHERE room=$1 AND track_id=$2", [roomId(code),id]);
+      if (!rows.length) return null;
+      const bytes=await media.get(rows[0].object_key);
+      if (bytes.length!==rows[0].byte_count) throw new Error("Incomplete track.");
+      return bytes;
     },
 
     enqueue(code, revision, trackId) {

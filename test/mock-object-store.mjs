@@ -23,7 +23,13 @@ Object.getPrototypeOf(handler).handle = async function(request) {
   let body = Buffer.alloc(0);
   if(request.method === "PUT") {
     assert.equal(request.headers["content-type"],"application/octet-stream");
-    await writeFile(path,request.body); // also model a lost confirmation after writing bytes
+    try {
+      await writeFile(path,request.body,{flag:request.headers["if-none-match"]==="*"?"wx":"w"});
+    } catch (err) {
+      if (err.code!=="EEXIST") throw err;
+      const error=Buffer.from("<Error><Code>PreconditionFailed</Code></Error>");
+      return {response:{statusCode:412,headers:{"content-length":String(error.length)},body:Readable.from([error])}};
+    } // Offline PUT also models a lost confirmation after writing bytes.
   } else if(!offline && request.method === "GET") body = await readFile(path);
   else if(!offline && request.method === "DELETE") await rm(path,{force:true});
   else assert.ok(offline);
