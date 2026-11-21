@@ -4,6 +4,7 @@ import { resolve, sep } from "node:path";
 import pg from "pg";
 import { mediaStorage, MediaConfigurationError } from "./media-storage.js";
 import { storageStep } from "./storage-diagnostics.js";
+import { musicMigration, musicStorage } from "./music-storage.js";
 
 function query(db, operation, sql, params) {
   return storageStep("postgres." + operation, () => db.query(sql, params));
@@ -47,6 +48,7 @@ async function database() {
     return {
       query:(...args)=>pool.query(...args),
       exec:text=>pool.query(text),
+      close:()=>pool.end(),
       transaction:async fn=>{
         const client=await pool.connect();
         let discard;
@@ -74,7 +76,7 @@ async function database() {
   return new PGlite(actual);
 }
 
-export async function openStorage() {
+export async function openStorage({enableMusicStorage = false} = {}) {
   const media = mediaStorage();
   const configured = process.env.CHATCODE_STORAGE_BUDGET_BYTES ?? String(128 * MiB);
   const budget = Number(configured);
@@ -82,10 +84,16 @@ export async function openStorage() {
     throw new MediaConfigurationError("CHATCODE_STORAGE_BUDGET_BYTES must be a nonnegative integer.");
   const db = await database();
   await db.exec(sql);
+  const lockBudget = tx => query(tx,"lock_budget","SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+  await db.transaction(async tx => {
+    await lockBudget(tx);
+    for (const statement of musicMigration) await tx.query(statement);
+  });
   async function checkSpace(tx, room, size) {
     const {rows} = await query(tx,"check_budget",`SELECT sum(byte_count) AS total,
       sum(byte_count) FILTER (WHERE room=$1) AS local FROM (
         SELECT byte_count, room FROM chatcode_messages WHERE byte_count>0
+        UNION ALL SELECT byte_count, room FROM chatcode_music_tracks
         UNION ALL SELECT byte_count, room FROM chatcode_object_cleanup
       ) usage`, [room]);
     if (Number(rows[0].total) + size > budget || Number(rows[0].local) + size > 40 * MiB) {
@@ -105,12 +113,14 @@ export async function openStorage() {
       (SELECT seq FROM chatcode_messages WHERE room=$1 ORDER BY seq DESC OFFSET 100) RETURNING object_key,byte_count,room`,[room]);
     await collectKeys(tx,deleted.rows);
   }
-  let cleaning=false;
-  async function cleanup() {
-    if (cleaning) return;
-    cleaning=true;
+  let cleaning;
+  async function cleanObjects() {
     try {
-      const {rows}=await db.query("SELECT object_key FROM chatcode_object_cleanup WHERE due <= now() ORDER BY due LIMIT 50");
+      // Compete with publication for the reservation row before deleting its object.
+      await db.query(`UPDATE chatcode_object_cleanup SET music_upload_id=NULL
+        WHERE music_upload_id IS NOT NULL AND due<=clock_timestamp()`);
+      const {rows}=await db.query(`SELECT object_key FROM chatcode_object_cleanup
+        WHERE music_upload_id IS NULL AND due <= now() ORDER BY due LIMIT 50`);
       for(const {object_key} of rows) {
         try {
           await media.remove(object_key);
@@ -120,12 +130,21 @@ export async function openStorage() {
         }
       }
     } catch {console.error("Attachment cleanup deferred.");}
-    finally {cleaning=false;}
   }
-  setInterval(cleanup,60000).unref();
+  function cleanup() {
+    cleaning ??= cleanObjects().finally(()=>{cleaning=undefined;});
+    return cleaning;
+  }
+  const interval=setInterval(cleanup,60000).unref();
   void cleanup();
 
   return {
+    music: enableMusicStorage ? musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget}) : undefined,
+    async close() {
+      clearInterval(interval);
+      await cleaning;
+      await db.close();
+    },
     checkUploadSpace: (code, size) => checkSpace(db, roomId(code), size),
     async history(code) {
       const {rows}=await db.query("SELECT payload FROM chatcode_messages WHERE room=$1 ORDER BY seq",[roomId(code)]);
@@ -142,7 +161,7 @@ export async function openStorage() {
       if(objectKey){
         // The reservation survives a crash between PUT and the message commit.
         await storageStep("postgres.reserve_transaction",()=>db.transaction(async tx=>{
-          await query(tx,"lock_budget","SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+          await lockBudget(tx);
           if(file.objectKey){
             // A lost commit acknowledgement must never queue a published object for deletion.
             const reserved=await query(tx,"find_reservation","SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now()",[objectKey]);
@@ -158,7 +177,7 @@ export async function openStorage() {
       }
       await storageStep("postgres.publish_transaction",()=>db.transaction(async tx=>{
         // Serialize retention and storage-budget decisions in the same transaction.
-        await query(tx,"lock_budget","SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+        await lockBudget(tx);
         if(objectKey){
           const claimed=await query(tx,"claim_reservation","DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now() RETURNING object_key",[objectKey]);
           if(!claimed.rows.length)throw expiredReservation();

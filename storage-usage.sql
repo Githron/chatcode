@@ -6,6 +6,9 @@ SELECT CASE WHEN object_key IS NULL THEN 'database'
 FROM chatcode_messages WHERE attachment_id IS NOT NULL
 GROUP BY 1 ORDER BY 1;
 
+SELECT count(*) AS music_tracks, coalesce(sum(byte_count), 0) AS encrypted_music_bytes
+FROM chatcode_music_tracks;
+
 SELECT count(*) AS reserved_or_pending_deletes,
        coalesce(sum(byte_count), 0) AS known_reserved_bytes,
        count(*) FILTER (WHERE byte_count IS NULL) AS older_entries_with_unknown_size

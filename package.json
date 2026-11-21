@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node e2e-test.mjs"
+    "test": "node e2e-test.mjs && node --test test/music-storage.test.mjs"
   },
   "repository": {
     "type": "git",
