@@ -1,6 +1,6 @@
 export const fileLimit = 10 * 1024 * 1024;
 export const uploadLimit = name => /\.(png|jpe?g|webp|gif)$/i.test(name) ? 8_000_000 : fileLimit;
-export const formats = /\.(png|jpe?g|webp|gif|zip|pdf|docx|xlsx|pptx|txt|md|csv)$/i;
+export const formats = /\.(png|jpe?g|webp|gif|mp4|webm|zip|pdf|docx|xlsx|pptx|txt|md|csv)$/i;
 export const sizeLabel = bytes => bytes < 1024 ? bytes+" B" : bytes < 1048576 ? Math.ceil(bytes/1024)+" KiB" : (bytes/1048576).toFixed(1)+" MiB";
 
 export async function roomKey(code) {

@@ -24,6 +24,11 @@ app.use((req, res, next) => {
     "Content-Security-Policy":"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" });
   next();
 });
+// The chat keeps its original CSP. Only this script-free document can play local Blobs.
+app.get("/video-player.html", (_req,res,next)=>{
+  res.set("Content-Security-Policy","default-src 'none'; media-src blob:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-same-origin");
+  next();
+});
 app.get("/ping", (_req, res) => res.sendStatus(200));
 app.use(express.static(fileURLToPath(new URL("./public/", import.meta.url))));
 const encoded = value => typeof value === "string" && value.length >= 40 && value.length <= 4096 && /^[A-Za-z0-9+/]+={0,2}$/.test(value);

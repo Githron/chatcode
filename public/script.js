@@ -1,6 +1,10 @@
 import { uploadLimit, formats, sizeLabel, roomKey, encodeText, decodeText, upload, fetchFile } from "./transfer.js";
 
-import {downloadBlob, imagePreview, isPreviewImage, releasePreviews} from "./image-preview.js";
+import {downloadBlob, imagePreview, isPreviewImage, releasePreviews as releaseImages} from "./image-preview.js";
+import {videoPlayer, releaseVideo} from "./video-player.js";
+
+function releasePreviews(root){releaseImages(root);releaseVideo(root);}
+window.addEventListener("pagehide",()=>releaseVideo());
 
 const $ = id => document.getElementById(id);
 const socket = io();
@@ -121,6 +125,7 @@ socket.on("connect",async()=>{
   controls();
 });
 socket.on("disconnect",()=>{
+  releaseVideo();
   connectionVersion++;epoch++;pendingLive=[];syncing=true;token="";stagedId="";uploadController?.abort();stopTyping();resetTypists();
   $("network").textContent="Reconnecting…";$("wake-status").textContent="Reconnecting…";controls();
 });
@@ -193,7 +198,7 @@ $("remove-file").onclick=()=>{resetFile();clientId="";controls();input.focus();}
 $("file-input").onchange=e=>{
   const next=e.target.files[0];if(!next)return;
   if(!formats.test(next.name)||!next.size||next.size>uploadLimit(next.name)){
-    $("send-error").textContent="Choose a supported image up to 8 MB, or a PDF, ZIP, Office or text file up to 10 MiB.";$("file-input").value="";return;
+    $("send-error").textContent="Choose an image up to 8 MB, or an MP4, WebM, PDF, ZIP, Office or text file up to 10 MiB.";$("file-input").value="";return;
   }
   resetFile();file=next;clientId="";$("send-error").textContent="";
   if(/\.(png|jpe?g|webp|gif)$/i.test(file.name)){
@@ -263,6 +268,9 @@ function attachmentView(f){
   info.append(icon("file"),summary);wrap.append(info);
   if(isPreviewImage(f)){
     wrap.prepend(imagePreview(f,()=>({key,token})));
+  }else if(f.type==="video/mp4" || f.type==="video/webm"){
+    wrap.classList.add("video-attachment");
+    wrap.prepend(videoPlayer(f,()=>({key,token})));
   }
   wrap.append(button("Download","download",async e=>{
     const b=e.currentTarget, generation=epoch;b.disabled=true;

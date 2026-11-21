@@ -12,6 +12,10 @@ import { mediaStorage } from "./media-storage.js";
 import { storageStep } from "./storage-diagnostics.js";
 import { S3Client } from "@aws-sdk/client-s3";
 import pg from "pg";
+import {validateVideo} from "./video-container.js";
+
+const mp4=await readFile(new URL("./test/fixtures/clip.mp4",import.meta.url));
+const webm=await readFile(new URL("./test/fixtures/clip.webm",import.meta.url));
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 const room = "test-"+randomUUID().slice(0,12);
@@ -31,6 +35,25 @@ function next(socket,event) {
 function request(socket,event,data) {
   return socket.timeout(3500).emitWithAck(event,data);
 }
+
+test("video validation requires bounded containers, a video track and media data",()=>{
+  function replace(bytes,from,to){
+    const result=Buffer.from(bytes), pos=result.indexOf(from);
+    assert.ok(pos>=0);
+    Buffer.from(to).copy(result,pos);
+    return result;
+  }
+  validateVideo(mp4,"mp4");validateVideo(webm,"webm");
+  const shortMedia=Buffer.from(mp4.subarray(0,mp4.indexOf("mdat")+5));
+  shortMedia.writeUInt32BE(9,shortMedia.indexOf("mdat")-4);
+  for(const bytes of [webm,mp4.subarray(0,24),mp4.subarray(0,-1),replace(mp4,"vide","soun"),
+    shortMedia,replace(mp4,"mdat","free"),replace(mp4,"stsd","free"),Buffer.from("0000000166747970ffffffffffffffff","hex")])
+    assert.throws(()=>validateVideo(bytes,"mp4"));
+  for(const bytes of [mp4,webm.subarray(0,36),webm.subarray(0,-1),replace(webm,"webm","xxxx"),
+    replace(webm,"V_VP8","A_OPU"),replace(webm,Buffer.from("1f43b675","hex"),Buffer.from("1c53bb6b","hex")),
+    Buffer.from("1a45dfa3801853806700","hex")])
+    assert.throws(()=>validateVideo(bytes,"webm"));
+});
 
 test("media configuration fails closed and allows an explicit database fallback",()=>{
   assert.throws(()=>mediaStorage({}),/Configure R2/);
@@ -99,6 +122,18 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
   return "http://127.0.0.1:"+port;
   }
   let url=await address();
+  await t.test("only the script-free video frame can load Blob media",async()=>{
+    const chat=await fetch(url),frame=await fetch(url+"/video-player.html");
+    assert.equal(frame.status,200);
+    assert.match(chat.headers.get("content-security-policy"),/frame-ancestors 'none'/);
+    assert.doesNotMatch(chat.headers.get("content-security-policy"),/media-src/);
+    const policy=frame.headers.get("content-security-policy");
+    for(const directive of ["default-src 'none'","media-src blob:","frame-ancestors 'self'","sandbox allow-same-origin"])
+      assert.ok(policy.split("; ").includes(directive));
+    const markup=await frame.text();
+    assert.match(markup,/<video controls playsinline preload="none"/);
+    assert.doesNotMatch(markup,/<script|<source|\s(?:autoplay|src)=/i);
+  });
   async function restart(){
     const ended=once(server,"exit");server.kill();await ended;
     server=start();url=await address();
@@ -158,7 +193,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     assert.equal(limited.status,429);
     assert.equal(limited.headers.get("retry-after"),"60");
   });
-  for(const [name,data] of [["sample.png",png],["notes.pdf",Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")],["notes.docx",docx],["notes.txt",Buffer.from("Meeting notes")],["still.gif",gif],["files.zip",docx]]){
+  for(const [name,data] of [["sample.png",png],["notes.pdf",Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")],["notes.docx",docx],["notes.txt",Buffer.from("Meeting notes")],["still.gif",gif],["files.zip",docx],["clip.mp4",mp4],["clip.webm",webm]]){
     await t.test("upload, publish and byte-for-byte download of "+name,async()=>{
       const uploaded=await upload(name,data);assert.equal(uploaded.status,201);
       const f=await uploaded.json();assert.equal(f.name,name);
@@ -172,6 +207,20 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
       last=f.id;
     });
   }
+  await t.test("video upload rejects mislabeled bytes and enforces the plaintext 10 MiB boundary",async()=>{
+    const tester=await connect(), member=await join(tester,"Tester",room);
+    assert.equal((await upload("clip.webm",webm,"")).status,401);
+    assert.equal((await upload("clip.mp4",webm,member.token)).status,415);
+    assert.equal((await upload("clip.webm",webm.subarray(0,24),member.token)).status,415);
+    const free=Buffer.alloc(fileLimit-mp4.length);
+    free.writeUInt32BE(free.length);free.write("free",4);
+    const limit=await upload("limit.mp4",Buffer.concat([mp4,free]),member.token);
+    assert.equal(limit.status,201);
+    const attachmentId=(await limit.json()).id;
+    assert.equal((await request(other,"send_message",{room:"another-room",attachmentId})).ok,false);
+    assert.equal((await upload("large.webm",Buffer.alloc(fileLimit+1),member.token)).status,413);
+    tester.disconnect();
+  });
   await t.test("validation, room clear and revoked access",async()=>{
     assert.equal((await upload("wrong.png",Buffer.from("This is text"))).status,415);
     assert.equal((await upload("wrong.gif",png)).status,415);
@@ -191,8 +240,8 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
   });
   const code="history-"+randomUUID().slice(0,8);
   const historyKey=await roomKey(code);
-  const postImage=async(token)=>fetch(url+"/api/files",{method:"POST",
-    headers:{...auth(token),"Content-Type":"application/octet-stream","X-File-Name":"record.png"},body:await seal(historyKey,png)});
+  const postFile=async(token,name="record.png",bytes=png)=>fetch(url+"/api/files",{method:"POST",
+    headers:{...auth(token),"Content-Type":"application/octet-stream","X-File-Name":name},body:await seal(historyKey,bytes)});
   let fileId,legacyId;
   await t.test("100-message snapshot, replay, prune, room isolation and process restart",async()=>{
     const identity=randomUUID();
@@ -257,7 +306,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     assert.deepEqual(separate.history,[]);
     assert.equal((await download(fileId,separate.token)).status,404);
     assert.equal((await download(fileId,back.token)).status,401);
-    const legacy=await (await postImage(restored.token)).json();
+    const legacy=await (await postFile(restored.token)).json();
     assert.ok((await request(fresh,"send_message",{room:code,attachmentId:legacy.id})).ok);
     legacyId=legacy.id;
   });
@@ -270,40 +319,46 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     for(const id of [fileId,legacyId]){
       assert.deepEqual(Buffer.from(await unseal(historyKey,new Uint8Array(await (await download(id,r.token)).arrayBuffer()))),png);
     }
-    const image=await (await postImage(u.token)).json();
-    const message={room:code,attachmentId:image.id,clientId:randomUUID()};
+    const clip=await (await postFile(u.token,"clip.webm",webm)).json();
+    const message={room:code,attachmentId:clip.id,clientId:randomUUID()};
     const offline=pathJoin(objects,"offline");
     await writeFile(offline,"");
     assert.equal((await request(uploader,"send_message",message)).ok,false);
     assert.ok(stderr.includes(JSON.stringify({event:"storage_failure",operation:"r2.PutObject",code:"AccessDenied",httpStatus:403})));
-    assert.equal((await download(image.id,r.token)).status,404);
-    assert.equal((await join(reader,"Reader",code)).history.some(m=>m.attachment?.id===image.id),false);
+    assert.equal((await download(clip.id,r.token)).status,404);
+    assert.equal((await join(reader,"Reader",code)).history.some(m=>m.attachment?.id===clip.id),false);
     await rm(offline);
     const incoming=next(reader,"receive_message"), own=next(uploader,"receive_message");
     const success=await request(uploader,"send_message",message);
     assert.ok(success.ok);
     assert.deepEqual(await request(uploader,"send_message",message),success);
-    assert.equal((await incoming).attachment.type,"image/png");
+    assert.equal((await incoming).attachment.type,"video/webm");
     assert.equal((await own).authorId,u.authorId);
     const keys=(await readdir(objects)).filter(k=>k.startsWith("r2-"));
     assert.equal(keys.length,1);
-    assert.notDeepEqual(await readFile(pathJoin(objects,keys[0])),png);
+    assert.notDeepEqual(await readFile(pathJoin(objects,keys[0])),webm);
     await writeFile(offline,"");
-    assert.equal((await download(image.id,r.token)).status,503);
-    assert.equal((await download(image.id,x.token)).status,404);
-    assert.equal((await download(image.id,"")).status,401);
+    assert.equal((await download(clip.id,r.token)).status,503);
+    assert.equal((await download(clip.id,x.token)).status,404);
+    assert.equal((await download(clip.id,"")).status,401);
     await rm(offline);
+    const picture=await (await postFile(u.token)).json();
+    const savedPicture=await request(uploader,"send_message",{room:code,attachmentId:picture.id,clientId:randomUUID()});
+    assert.ok(savedPicture.ok);
     budget=0;
     await restart();
     const returning=await connect(), restoredR2=await join(returning,"Reader",code);
-    assert.equal(restoredR2.history.at(-1).id,success.id);
-    const response=await download(image.id,restoredR2.token);
+    assert.equal(restoredR2.history.at(-1).id,savedPicture.id);
+    assert.equal(restoredR2.history.find(m=>m.id===success.id).attachment.type,"video/webm");
+    const restoredPicture=await download(picture.id,restoredR2.token);
+    assert.deepEqual(Buffer.from(await unseal(historyKey,new Uint8Array(await restoredPicture.arrayBuffer()))),png);
+    const response=await download(clip.id,restoredR2.token);
     assert.equal(response.headers.get("cache-control"),"no-store");
-    assert.deepEqual(Buffer.from(await unseal(historyKey,new Uint8Array(await response.arrayBuffer()))),png);
-    assert.equal((await postImage(restoredR2.token)).status,507);
+    assert.deepEqual(Buffer.from(await unseal(historyKey,new Uint8Array(await response.arrayBuffer()))),webm);
+    assert.equal((await postFile(restoredR2.token)).status,507);
     assert.ok((await request(returning,"send_message",{room:code,message:await encodeText(historyKey,"Still here")})).ok);
     await request(returning,"clear_chat",{room:code,confirm:true});
-    assert.equal((await download(image.id,restoredR2.token)).status,404);
+    assert.equal((await download(clip.id,restoredR2.token)).status,404);
     assert.deepEqual((await join(returning,"Reader",code)).history,[]);
     for(let i=0;i<50 && (await readdir(objects)).length;i++)await new Promise(resolve=>setTimeout(resolve,100));
     assert.deepEqual(await readdir(objects),[]);
@@ -347,7 +402,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     budget=128*1024*1024;
     await restart();
     const writer=await connect(), member=await join(writer,"Writer",code);
-    const staged=await postImage(member.token);
+    const staged=await postFile(member.token,"clip.mp4",mp4);
     assert.equal(staged.status,201);
     const file=await staged.json();
     const payload={room:code,clientId:randomUUID(),attachmentId:file.id};

@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import yauzl from "yauzl";
 import { imageSize } from "image-size";
 import { fileLimit, uploadLimit } from "./public/transfer.js";
+import { validateVideo } from "./video-container.js";
 
 const derive = promisify(pbkdf2);
 const MiB = 1024 * 1024;
@@ -11,6 +12,7 @@ const envelopeLimit = fileLimit + 28;
 const files = new Map();
 const inflight = new Set();
 const allowed = {
+  mp4: "video/mp4", webm: "video/webm",
   jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", zip: "application/zip",
   pdf: "application/pdf", txt: "text/plain", md: "text/markdown", csv: "text/csv",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -76,6 +78,8 @@ async function validate(data, ext) {
         image.width * image.height > 32_000_000) throw invalid();
     if (ext==="gif")checkGif(data);
     return {width:image.width,height:image.height};
+  } else if (allowed[ext].startsWith("video/")) {
+    validateVideo(data, ext);
   } else if (ext === "pdf") {
     if (!data.subarray(0, 5).equals(Buffer.from("%PDF-")) || !data.subarray(-1024).includes("%%EOF")) throw invalid();
   } else if (office[ext] || ext==="zip") {
@@ -169,7 +173,7 @@ export function attachmentRoutes(app, sessions, storage) {
       files.set(id, { info, bytes, owner: peer.token, room: peer.room, published: false, expires: Date.now() + 120_000 });
       res.status(201).json(info);
     } catch {
-      res.status(415).json({ error: "File validation failed. Check the format, image dimensions, and file name." });
+      res.status(415).json({ error: "File validation failed. Check that the file is complete and matches its extension." });
     } finally { plaintext?.fill(0); key?.fill(0); }
   });
 
