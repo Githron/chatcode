@@ -3,11 +3,11 @@ import { randomUUID, pbkdf2, createDecipheriv } from "node:crypto";
 import { promisify } from "node:util";
 import yauzl from "yauzl";
 import { imageSize } from "image-size";
+import { fileLimit, uploadLimit } from "./public/transfer.js";
 
 const derive = promisify(pbkdf2);
 const MiB = 1024 * 1024;
-export const FILE_LIMIT = 10 * MiB;
-const envelopeLimit = FILE_LIMIT + 28;
+const envelopeLimit = fileLimit + 28;
 const files = new Map();
 const inflight = new Set();
 const allowed = {
@@ -115,6 +115,7 @@ export function stagedFile(id, peer) {
 export function releaseFile(id) { files.delete(id); }
 
 export function attachmentRoutes(app, sessions, storage) {
+  let recentUploads = [];
   app.use("/api/files", (req, res, next) => {
     res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
     const peer = sessions.get((req.get("Authorization") || "").replace(/^Bearer /, ""));
@@ -123,15 +124,28 @@ export function attachmentRoutes(app, sessions, storage) {
     next();
   });
 
-  app.post("/api/files", (req, res, next) => {
+  app.post("/api/files", async (req, res, next) => {
     const size = Number(req.get("Content-Length"));
     const { token, room } = req.peer;
-    if (!Number.isSafeInteger(size) || size <= 28 || size > envelopeLimit || !req.is("application/octet-stream") || req.get("Content-Encoding"))
-      return res.status(413).json({ error: "Choose a nonempty file up to 10 MiB." });
+    let name;
+    try { name = decodeURIComponent(req.get("X-File-Name") || "").normalize("NFC"); } catch { name = ""; }
+    const ext = name.split(".").pop().toLowerCase();
+    if (!name.includes(".") || !Object.hasOwn(allowed, ext) || name.length > 160 || /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(name) || name.startsWith("."))
+      return res.status(415).json({error:"Choose a supported file with a safe filename."});
+    if (!Number.isSafeInteger(size) || size <= 28 || size > uploadLimit(name)+28 || !req.is("application/octet-stream") || req.get("Content-Encoding"))
+      return res.status(413).json({ error: "Choose a nonempty image up to 8 MB or another supported file up to 10 MiB." });
     if (inflight.has(token) || inflight.size >= 4 || !hasSpace(room, size)) return res.status(429).json({ error: "File storage is busy or full. Try again later." });
+    const now = Date.now();
+    recentUploads = recentUploads.filter(entry => now-entry.time < 60_000);
+    if (recentUploads.length >= 120 || recentUploads.filter(entry => entry.token === token).length >= 12)
+      return res.set("Retry-After","60").status(429).json({error:"Too many uploads. Try again in a minute."});
+    recentUploads.push({time:now,token});
+    req.fileName = name;
     req.fileGeneration = req.peer.state.generation;
     inflight.add(token);
     res.once("close", () => inflight.delete(token));
+    try { await storage.checkUploadSpace(room,size); }
+    catch (err) { return res.status(err.publicMessage ? 507 : 503).json({error:err.publicMessage || "Storage is unavailable. Please retry."}); }
     next();
   }, express.raw({ type: "application/octet-stream", limit: envelopeLimit, inflate: false }), async (req, res) => {
     const peer = req.peer;
@@ -139,9 +153,8 @@ export function attachmentRoutes(app, sessions, storage) {
     let plaintext;
     let key;
     try {
-      const name = decodeURIComponent(req.get("X-File-Name") || "").normalize("NFC");
+      const name = req.fileName;
       const ext = name.split(".").pop().toLowerCase();
-      if (!name.includes(".") || !Object.hasOwn(allowed, ext) || name.length > 160 || /[\\/<>:"|?*\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(name) || name.startsWith(".")) throw invalid();
       const bytes = req.body;
       key = await derive(peer.room, "chatcode-salt-v1", 100000, 32, "sha256");
       const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));

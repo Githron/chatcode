@@ -1,4 +1,4 @@
-import { fileLimit, formats, sizeLabel, roomKey, encodeText, decodeText, upload, fetchFile } from "./transfer.js";
+import { uploadLimit, formats, sizeLabel, roomKey, encodeText, decodeText, upload, fetchFile } from "./transfer.js";
 
 import {downloadBlob, imagePreview, isPreviewImage, releasePreviews} from "./image-preview.js";
 
@@ -192,8 +192,8 @@ $("attach").onclick=()=>$("file-input").click();
 $("remove-file").onclick=()=>{resetFile();clientId="";controls();input.focus();};
 $("file-input").onchange=e=>{
   const next=e.target.files[0];if(!next)return;
-  if(!formats.test(next.name)||!next.size||next.size>fileLimit){
-    $("send-error").textContent="Choose a PNG, JPEG, WebP, single-frame GIF, PDF, ZIP, Office or text file up to 10 MiB.";$("file-input").value="";return;
+  if(!formats.test(next.name)||!next.size||next.size>uploadLimit(next.name)){
+    $("send-error").textContent="Choose a supported image up to 8 MB, or a PDF, ZIP, Office or text file up to 10 MiB.";$("file-input").value="";return;
   }
   resetFile();file=next;clientId="";$("send-error").textContent="";
   if(/\.(png|jpe?g|webp|gif)$/i.test(file.name)){

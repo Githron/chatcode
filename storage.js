@@ -1,10 +1,15 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { mkdir, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import pg from "pg";
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { mediaStorage, MediaConfigurationError } from "./media-storage.js";
 
 const MiB = 1024 * 1024;
+function expiredReservation() {
+  const error = new Error("Attachment expired. Please retry the upload.");
+  error.publicMessage = error.message;
+  return error;
+}
 const roomId = room => createHash("sha256").update(room).digest("hex");
 const sql = `
   CREATE TABLE IF NOT EXISTS chatcode_messages (
@@ -24,6 +29,8 @@ const sql = `
     object_key text PRIMARY KEY,
     due timestamptz NOT NULL DEFAULT now()
   );
+  ALTER TABLE chatcode_object_cleanup ADD COLUMN IF NOT EXISTS byte_count integer;
+  ALTER TABLE chatcode_object_cleanup ADD COLUMN IF NOT EXISTS room text;
   CREATE TABLE IF NOT EXISTS chatcode_storage_lock (id integer PRIMARY KEY);
   INSERT INTO chatcode_storage_lock VALUES (1) ON CONFLICT DO NOTHING;
 `;
@@ -61,34 +68,45 @@ async function database() {
 }
 
 export async function openStorage() {
+  const media = mediaStorage();
+  const configured = process.env.CHATCODE_STORAGE_BUDGET_BYTES ?? String(128 * MiB);
+  const budget = Number(configured);
+  if (!/^\d+$/.test(configured) || !Number.isSafeInteger(budget))
+    throw new MediaConfigurationError("CHATCODE_STORAGE_BUDGET_BYTES must be a nonnegative integer.");
   const db = await database();
   await db.exec(sql);
-  const bucket=process.env.S3_BUCKET;
-  const s3=bucket ? new S3Client({
-    region:process.env.AWS_REGION || "us-east-1",
-    endpoint:process.env.S3_ENDPOINT || undefined,
-    forcePathStyle:!!process.env.S3_ENDPOINT,
-    maxAttempts:2,
-  }) : null;
-  const locator=key=>({Bucket:bucket, Key:key});
-  function collectKeys(tx, rows) {
-    const keys=rows.map(row=>row.object_key).filter(Boolean);
-    if (keys.length) return tx.query("INSERT INTO chatcode_object_cleanup(object_key) SELECT unnest($1::text[]) ON CONFLICT DO NOTHING",[keys]);
+  async function checkSpace(tx, room, size) {
+    const {rows} = await tx.query(`SELECT sum(byte_count) AS total,
+      sum(byte_count) FILTER (WHERE room=$1) AS local FROM (
+        SELECT byte_count, room FROM chatcode_messages WHERE byte_count>0
+        UNION ALL SELECT byte_count, room FROM chatcode_object_cleanup
+      ) usage`, [room]);
+    if (Number(rows[0].total) + size > budget || Number(rows[0].local) + size > 40 * MiB) {
+      const error = new Error("Attachment storage is full. You can still send text.");
+      error.publicMessage = error.message;
+      throw error;
+    }
+  }
+  async function collectKeys(tx, rows) {
+    const objects = rows.filter(row => row.object_key);
+    if (objects.length) await tx.query(`INSERT INTO chatcode_object_cleanup(object_key, byte_count, room)
+      SELECT * FROM unnest($1::text[], $2::integer[], $3::text[]) ON CONFLICT DO NOTHING`,
+      [objects.map(r=>r.object_key), objects.map(r=>r.byte_count), objects.map(r=>r.room)]);
   }
   async function trim(tx,room) {
     const deleted=await tx.query(`DELETE FROM chatcode_messages WHERE room=$1 AND seq IN
-      (SELECT seq FROM chatcode_messages WHERE room=$1 ORDER BY seq DESC OFFSET 100) RETURNING object_key`,[room]);
+      (SELECT seq FROM chatcode_messages WHERE room=$1 ORDER BY seq DESC OFFSET 100) RETURNING object_key,byte_count,room`,[room]);
     await collectKeys(tx,deleted.rows);
   }
   let cleaning=false;
   async function cleanup() {
-    if (!s3 || cleaning) return;
+    if (cleaning) return;
     cleaning=true;
     try {
       const {rows}=await db.query("SELECT object_key FROM chatcode_object_cleanup WHERE due <= now() ORDER BY due LIMIT 50");
       for(const {object_key} of rows) {
         try {
-          await s3.send(new DeleteObjectCommand(locator(object_key)),{abortSignal:AbortSignal.timeout(15000)});
+          await media.remove(object_key);
           await db.query("DELETE FROM chatcode_object_cleanup WHERE object_key=$1",[object_key]);
         } catch {
           await db.query("UPDATE chatcode_object_cleanup SET due=now()+interval '5 minutes' WHERE object_key=$1",[object_key]);
@@ -101,6 +119,7 @@ export async function openStorage() {
   void cleanup();
 
   return {
+    checkUploadSpace: (code, size) => checkSpace(db, roomId(code), size),
     async history(code) {
       const {rows}=await db.query("SELECT payload FROM chatcode_messages WHERE room=$1 ORDER BY seq",[roomId(code)]);
       return rows.map(r=>r.payload);
@@ -112,46 +131,50 @@ export async function openStorage() {
     },
     async save(code,event,clientId,file) {
       const room=roomId(code);
-      let objectKey=null;
-      if(s3 && file){
-        objectKey="chatcode/"+randomUUID();
+      const objectKey=file ? file.objectKey || media.newKey() : null;
+      if(objectKey){
         // The reservation survives a crash between PUT and the message commit.
-        await db.query("INSERT INTO chatcode_object_cleanup(object_key,due) VALUES($1,now()+interval '1 hour')",[objectKey]);
-        await s3.send(new PutObjectCommand({...locator(objectKey),Body:file.bytes,ContentType:"application/octet-stream"}),{abortSignal:AbortSignal.timeout(45000)});
+        await db.transaction(async tx=>{
+          await tx.query("SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+          if(file.objectKey){
+            // A lost commit acknowledgement must never queue a published object for deletion.
+            const reserved=await tx.query("SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now()",[objectKey]);
+            if(!reserved.rows.length)throw expiredReservation();
+            return;
+          }
+          await checkSpace(tx,room,file.bytes.length);
+          await tx.query(`INSERT INTO chatcode_object_cleanup(object_key,due,byte_count,room)
+            VALUES($1,now()+interval '1 hour',$2,$3)`,[objectKey,file.bytes.length,room]);
+        });
+        file.objectKey=objectKey;
+        await media.put(objectKey,file.bytes);
       }
       await db.transaction(async tx=>{
         // Serialize retention and storage-budget decisions in the same transaction.
         await tx.query("SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+        if(objectKey){
+          const claimed=await tx.query("DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now() RETURNING object_key",[objectKey]);
+          if(!claimed.rows.length)throw expiredReservation();
+        }
+        if(file && !objectKey)await checkSpace(tx,room,file.bytes.length);
         await tx.query(`INSERT INTO chatcode_messages
           (room,message_id,client_id,payload,attachment_id,byte_count,ciphertext,object_key)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[
           room,event.id,clientId||null,JSON.stringify(event),file?.info.id||null,
           file?.bytes.length||0,file&&!objectKey?file.bytes:null,objectKey]);
         await trim(tx,room);
-        if(file){
-          const {rows}=await tx.query(`SELECT sum(byte_count) AS total,
-            sum(byte_count) FILTER(WHERE room=$1) AS local FROM chatcode_messages WHERE byte_count>0`,[room]);
-          if(Number(rows[0].local)>40*MiB || Number(rows[0].total)>128*MiB){
-            const error=new Error("File storage is full. Send text or clear files before retrying.");
-            error.publicMessage=error.message;
-            throw error;
-          }
-        }
-        if(objectKey)await tx.query("DELETE FROM chatcode_object_cleanup WHERE object_key=$1",[objectKey]);
       });
     },
     async readFile(code,id) {
       const {rows}=await db.query("SELECT ciphertext,object_key FROM chatcode_messages WHERE room=$1 AND attachment_id=$2",[roomId(code),id]);
       if(!rows.length)return null;
       if(!rows[0].object_key)return Buffer.from(rows[0].ciphertext);
-      if(!s3)throw new Error("Private object storage unavailable.");
-      const object=await s3.send(new GetObjectCommand(locator(rows[0].object_key)),{abortSignal:AbortSignal.timeout(30000)});
-      return Buffer.from(await object.Body.transformToByteArray());
+      return media.get(rows[0].object_key);
     },
     async clear(code) {
       await db.transaction(async tx=>{
         await tx.query("SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
-        const deleted=await tx.query("DELETE FROM chatcode_messages WHERE room=$1 RETURNING object_key",[roomId(code)]);
+        const deleted=await tx.query("DELETE FROM chatcode_messages WHERE room=$1 RETURNING object_key,byte_count,room",[roomId(code)]);
         await collectKeys(tx,deleted.rows);
       });
       void cleanup();

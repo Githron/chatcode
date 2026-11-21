@@ -3,16 +3,19 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { webcrypto, randomUUID } from "node:crypto";
 import test from "node:test";
-import {mkdtemp, rm} from "node:fs/promises";
+import {mkdtemp, rm, mkdir, readFile, readdir, writeFile} from "node:fs/promises";
 import {tmpdir} from "node:os";
 import {join as pathJoin} from "node:path";
 import { io } from "socket.io-client";
 import { roomKey, encodeText, decodeText, seal, unseal, fileLimit } from "./public/transfer.js";
+import { mediaStorage } from "./media-storage.js";
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 const room = "test-"+randomUUID().slice(0,12);
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6AFcAAAAASUVORK5CYII=","base64");
 const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==","base64");
+const jpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/2wBDAQMDAwQDBAgEBAgQCwkLEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD/wAARCAABAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAHCf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/ADoDFU3/2Q==","base64");
+const webp = Buffer.from("UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAEAAgA0JaACdLoB+AADsAD+8MQL/yC5YXXI1/8gP+QH/ID/+PIAAAA=","base64");
 const docx = Buffer.from("UEsDBBQAAAAIAJO4dF2sbhJangAAANwAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbF2PsQ7CMBBDf6XKitqrGBhQ24UdGPiBU3JtI5pLlBwF/p4EpA6Mlu1nubu9A6Xq5RZOvZpFwhEg6ZkcpsYH4uyMPjqULOMEAfUdJ4J92x5AexZiqaUw1NBdVorRGqquGOWMjnoFTx8NGK8fLiebTFPV6Vcry73CEBarUaxnWNn8bdZ+HK2mrV9oIXpNKVme3NJsjkPLu4KHoYPvqeEDUEsDBBQAAAAIAJO4dF1hey9DiQAAAPIAAAALAAAAX3JlbHMvLnJlbHONzzsOAiEQBuCrEA6ws1pYGKCy2dZ4AQLDIy6PDBj19lJYrMbCcuaffH9GnHHVPZbcQqyNPdKam+Sh93oEaCZg0m0qFfNIXKGk+xjJQ9Xmqj3Cfp4PQFuDK7E12WIlp8XuOLs8K/5jF+eiwVMxt4S5/6j4uhiyJo9d8nshC/a9ngbLQQn4eFG9AFBLAwQUAAAACACTuHRdyUDSwnYAAACcAAAAEQAAAHdvcmQvZG9jdW1lbnQueG1sRc7BDcIwDAXQVaoOgCsOHKKQIdggJKGtVNuRbZSyPU05cHlfX5al75vLnN5YyIYdN1LX7uNiVh2ApqVg1AvXQsftxYLRjiozNJZchVNRXWnGDa7TdAOMK43BN/fk/OlZO9Kx8GDGgdiKeui9K6f19PcD/z3hC1BLAQIUAxQAAAAIAJO4dF2sbhJangAAANwAAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAgAk7h0XWF7L0OJAAAA8gAAAAsAAAAAAAAAAAAAAIABzwAAAF9yZWxzLy5yZWxzUEsBAhQDFAAAAAgAk7h0XclA0sJ2AAAAnAAAABEAAAAAAAAAAAAAAIABgQEAAHdvcmQvZG9jdW1lbnQueG1sUEsFBgAAAAADAAMAuQAAACYCAAAAAA==","base64");
 
 function next(socket,event) {
@@ -26,9 +29,26 @@ function request(socket,event,data) {
   return socket.timeout(3500).emitWithAck(event,data);
 }
 
-test("two-client room and private attachment transfers", {timeout:150000}, async t=>{
+test("media configuration fails closed and allows an explicit database fallback",()=>{
+  assert.throws(()=>mediaStorage({}),/Configure R2/);
+  assert.throws(()=>mediaStorage({R2_ACCOUNT_ID:"partial",CHATCODE_MEDIA_BACKEND:"database"}),/all five/);
+  assert.equal(mediaStorage({CHATCODE_MEDIA_BACKEND:"database"}).newKey(),null);
+});
+
+test("two-client room and private attachment transfers", {timeout:210000}, async t=>{
   const directory=await mkdtemp(pathJoin(tmpdir(),"chatcode-db-"));
-  const start=()=>spawn(process.execPath,["server.js"],{cwd:new URL("./",import.meta.url),env:{...process.env,DATABASE_URL:process.env.CHATCODE_TEST_DATABASE_URL||"",PGHOST:"",RENDER:"",NODE_ENV:"test",S3_BUCKET:"",CHATCODE_DATA_DIR:directory,PORT:"0"},stdio:["ignore","pipe","inherit"]});
+  const objects=pathJoin(directory,"objects");
+  await mkdir(objects);
+  const account="a".repeat(32);
+  let backend="database",budget=128*1024*1024;
+  const start=()=>spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
+    cwd:new URL("./",import.meta.url),env:{...process.env,DATABASE_URL:process.env.CHATCODE_TEST_DATABASE_URL||"",
+      PGHOST:"",RENDER:"",NODE_ENV:"test",CHATCODE_MEDIA_BACKEND:"database",CHATCODE_STORAGE_BUDGET_BYTES:String(budget),
+      S3_BUCKET:backend==="database"?"":"test-legacy",S3_ENDPOINT:"https://legacy.invalid",AWS_REGION:"us-east-1",
+      AWS_ACCESS_KEY_ID:"legacy-test",AWS_SECRET_ACCESS_KEY:"fixture",AWS_SESSION_TOKEN:"",
+      R2_ACCOUNT_ID:backend==="r2"?account:"",R2_ENDPOINT:backend==="r2"?"https://"+account+".r2.cloudflarestorage.com":"",
+      R2_BUCKET_NAME:backend==="r2"?"test-r2":"",R2_ACCESS_KEY_ID:backend==="r2"?"r2-test":"",R2_SECRET_ACCESS_KEY:backend==="r2"?"fixture":"",
+      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","inherit"]});
   let server=start();
   const clients=[];
   t.after(async()=>{
@@ -43,6 +63,10 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
   return "http://127.0.0.1:"+port;
   }
   let url=await address();
+  async function restart(){
+    const ended=once(server,"exit");server.kill();await ended;
+    server=start();url=await address();
+  }
   const connect=async()=>{
     const client=io(url,{autoConnect:false,reconnection:false});
     clients.push(client);
@@ -86,6 +110,18 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
     const typing=next(alice,"user_typing");bob.emit("typing_start",{room});assert.equal((await typing).username,"Bob");
   });
   let last;
+  await t.test("JPEG and WebP metadata and session upload throttling",async()=>{
+    for(const [name,data,type] of [["small.jpg",jpeg,"image/jpeg"],["small.webp",webp,"image/webp"]]){
+      const response=await upload(name,data,b.token);
+      assert.equal(response.status,201);
+      const {width,height,type:mime}=await response.json();
+      assert.deepEqual([width,height,mime],[2,1,type]);
+    }
+    for(let i=2;i<12;i++)assert.equal((await upload("small.png",png,b.token)).status,201);
+    const limited=await upload("small.png",png,b.token);
+    assert.equal(limited.status,429);
+    assert.equal(limited.headers.get("retry-after"),"60");
+  });
   for(const [name,data] of [["sample.png",png],["notes.pdf",Buffer.from("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")],["notes.docx",docx],["notes.txt",Buffer.from("Meeting notes")],["still.gif",gif],["files.zip",docx]]){
     await t.test("upload, publish and byte-for-byte download of "+name,async()=>{
       const uploaded=await upload(name,data);assert.equal(uploaded.status,201);
@@ -103,6 +139,8 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
   await t.test("validation, room clear and revoked access",async()=>{
     assert.equal((await upload("wrong.png",Buffer.from("This is text"))).status,415);
     assert.equal((await upload("wrong.gif",png)).status,415);
+    assert.equal((await upload("../file.png",png)).status,415);
+    assert.equal((await upload("oversize.png",Buffer.alloc(8_000_001))).status,413);
     assert.equal((await upload("wrong.zip",png)).status,415);
     assert.equal((await upload("active.svg",Buffer.from("<svg/>"))).status,415);
     assert.equal((await upload("ordinary.docx",Buffer.from("This is text"))).status,415);
@@ -115,9 +153,12 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
     const left=next(bob,"user_left");alice.disconnect();assert.match((await left).message,/Alice/);
     assert.equal((await download(last,a.token)).status,401);
   });
+  const code="history-"+randomUUID().slice(0,8);
+  const historyKey=await roomKey(code);
+  const postImage=async(token)=>fetch(url+"/api/files",{method:"POST",
+    headers:{...auth(token),"Content-Type":"application/octet-stream","X-File-Name":"record.png"},body:await seal(historyKey,png)});
+  let fileId,legacyId;
   await t.test("100-message snapshot, replay, prune, room isolation and process restart",async()=>{
-    const code="history-"+randomUUID().slice(0,8);
-    const historyKey=await roomKey(code);
     const identity=randomUUID();
     const author=await connect();
     const membership=await request(author,"join_room",{username:"Author",room:code,identity});
@@ -143,7 +184,8 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
       writer.disconnect();
     }
     assert.equal((await download(oldestFile,membership.token)).status,404);
-    const fileId=await attach(), clientId=randomUUID();
+    fileId=await attach();
+    const clientId=randomUUID();
     const late=await connect(),arrivals=[];
     late.on("receive_message",m=>arrivals.push(m.id));
     const joining=join(late,"Late",code);
@@ -165,8 +207,8 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
     assert.ok(back.history.every(m=>m.username && Number.isFinite(m.sentAt)));
     assert.equal((await download(fileId,outsider.token)).status,404);
     again.disconnect();
-    const ended=once(server,"exit");server.kill();await ended;
-    server=start();url=await address();
+    backend="legacy";
+    await restart();
     const fresh=await connect();
     const restored=await join(fresh,"Newcomer",code);
     assert.deepEqual(restored.history.map(m=>m.id),expected);
@@ -179,8 +221,87 @@ test("two-client room and private attachment transfers", {timeout:150000}, async
     assert.deepEqual(separate.history,[]);
     assert.equal((await download(fileId,separate.token)).status,404);
     assert.equal((await download(fileId,back.token)).status,401);
-    await request(fresh,"clear_chat",{room:code,confirm:true});
-    assert.equal((await download(fileId,restored.token)).status,404);
-    assert.deepEqual((await join(fresh,"Newcomer",code)).history,[]);
+    const legacy=await (await postImage(restored.token)).json();
+    assert.ok((await request(fresh,"send_message",{room:code,attachmentId:legacy.id})).ok);
+    legacyId=legacy.id;
+  });
+  await t.test("R2 publication, legacy reads, ambiguous writes, retry, budget pause and restart",async()=>{
+    backend="r2";
+    await restart();
+    const uploader=await connect(), reader=await connect(), otherRoom=await connect();
+    const u=await join(uploader,"Uploader",code), r=await join(reader,"Reader",code);
+    const x=await join(otherRoom,"Outsider","separate-room");
+    for(const id of [fileId,legacyId]){
+      assert.deepEqual(Buffer.from(await unseal(historyKey,new Uint8Array(await (await download(id,r.token)).arrayBuffer()))),png);
+    }
+    const image=await (await postImage(u.token)).json();
+    const message={room:code,attachmentId:image.id,clientId:randomUUID()};
+    const offline=pathJoin(objects,"offline");
+    await writeFile(offline,"");
+    assert.equal((await request(uploader,"send_message",message)).ok,false);
+    assert.equal((await download(image.id,r.token)).status,404);
+    assert.equal((await join(reader,"Reader",code)).history.some(m=>m.attachment?.id===image.id),false);
+    await rm(offline);
+    const incoming=next(reader,"receive_message"), own=next(uploader,"receive_message");
+    const success=await request(uploader,"send_message",message);
+    assert.ok(success.ok);
+    assert.deepEqual(await request(uploader,"send_message",message),success);
+    assert.equal((await incoming).attachment.type,"image/png");
+    assert.equal((await own).authorId,u.authorId);
+    const keys=(await readdir(objects)).filter(k=>k.startsWith("r2-"));
+    assert.equal(keys.length,1);
+    assert.notDeepEqual(await readFile(pathJoin(objects,keys[0])),png);
+    await writeFile(offline,"");
+    assert.equal((await download(image.id,r.token)).status,503);
+    assert.equal((await download(image.id,x.token)).status,404);
+    assert.equal((await download(image.id,"")).status,401);
+    await rm(offline);
+    budget=0;
+    await restart();
+    const returning=await connect(), restoredR2=await join(returning,"Reader",code);
+    assert.equal(restoredR2.history.at(-1).id,success.id);
+    const response=await download(image.id,restoredR2.token);
+    assert.equal(response.headers.get("cache-control"),"no-store");
+    assert.deepEqual(Buffer.from(await unseal(historyKey,new Uint8Array(await response.arrayBuffer()))),png);
+    assert.equal((await postImage(restoredR2.token)).status,507);
+    assert.ok((await request(returning,"send_message",{room:code,message:await encodeText(historyKey,"Still here")})).ok);
+    await request(returning,"clear_chat",{room:code,confirm:true});
+    assert.equal((await download(image.id,restoredR2.token)).status,404);
+    assert.deepEqual((await join(returning,"Reader",code)).history,[]);
+    for(let i=0;i<50 && (await readdir(objects)).length;i++)await new Promise(resolve=>setTimeout(resolve,100));
+    assert.deepEqual(await readdir(objects),[]);
+  });
+  await t.test("concurrent room publications reserve the global budget before writing objects",async()=>{
+    budget = 1024;
+    await restart();
+    async function prepare(){
+      const code="quota-"+randomUUID().slice(0,8), client=await connect();
+      const member=await join(client,"Writer",code);
+      const body=await seal(await roomKey(code),Buffer.alloc(700,65));
+      const stage=()=>fetch(url+"/api/files",{method:"POST",body,headers:{
+        ...auth(member.token),"Content-Type":"application/octet-stream","X-File-Name":"note.txt"}});
+      const staged=await stage();
+      assert.equal(staged.status,201);
+      const file=await staged.json();
+      return {stage,publish:()=>request(client,"send_message",{room:code,attachmentId:file.id,clientId:randomUUID()}),
+        clear:()=>request(client,"clear_chat",{room:code,confirm:true})};
+    }
+    const writers=await Promise.all([prepare(),prepare()]);
+    const results=await Promise.all(writers.map(writer=>writer.publish()));
+    assert.equal(results.filter(result=>result.ok).length,1);
+    assert.match(results.find(result=>!result.ok).error,/storage is full/);
+    assert.equal((await readdir(objects)).length,1);
+    const winner=writers[results.findIndex(result=>result.ok)];
+    assert.ok((await winner.clear()).ok);
+    for(let i=0;i<50 && (await readdir(objects)).length;i++)await new Promise(resolve=>setTimeout(resolve,100));
+    assert.deepEqual(await readdir(objects),[]);
+    // The durable cleanup must release its budget before the test stops the server.
+    let status;
+    for(let i=0;i<8;i++){
+      status=(await winner.stage()).status;
+      if(status!==507)break;
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    assert.equal(status,201);
   });
 });

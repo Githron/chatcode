@@ -6,10 +6,11 @@ import { Server } from "socket.io";
 import { attachmentRoutes, clearFiles, stagedFile, releaseFile } from "./attachments.js";
 
 import { openStorage } from "./storage.js";
+import { MediaConfigurationError } from "./media-storage.js";
 
 let storage;
 try {storage=await openStorage();}
-catch {console.error("History storage could not start. Check the database configuration and permissions.");process.exit(1);}
+catch (err) {console.error(err instanceof MediaConfigurationError ? err.message : "History storage could not start. Check the database configuration and permissions.");process.exit(1);}
 const app = express();
 app.disable("x-powered-by");
 const server = createServer(app);
