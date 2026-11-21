@@ -25,6 +25,7 @@ const rooms = new Map();
 const sessions = new Map();
 const channel = code => "chatcode:" + code;
 attachmentRoutes(app, sessions, storage, musicUploads || musicPlayback ? storage.music : null, musicUploads, room=>{
+  io.to(channel(room)).emit("music_library_changed");
   if (musicPlayback) refreshPlayback(room);
 });
 app.use((req, res, next) => {
@@ -140,7 +141,7 @@ io.on("connection", socket => {
     if(!socket.connected)return {ok:false,error:"Disconnected."};
     // Another join on this socket may have completed during the database read.
     if(peer && (peer.room!==room || peer.username!==username))return {ok:false,error:"Leave the current room first."};
-    if (peer)return {ok:true,token:peer.token,authorId:peer.authorId,history,musicPlayback};
+    if (peer)return {ok:true,token:peer.token,authorId:peer.authorId,history,musicPlayback,musicQueue,musicUploads};
     const authorId=createHash("sha256").update(room+"|"+(uuid(identity)?identity:randomUUID())).digest("hex");
     const state = rooms.get(room) || { members:new Map(), generation:0 };
     rooms.set(room,state);
@@ -150,14 +151,23 @@ io.on("connection", socket => {
     socket.join(channel(room));
     members(peer);
     socket.to(channel(room)).emit("user_joined",{message:username+" joined the room"});
-    return {ok:true,token:peer.token,authorId,history,musicPlayback};
+    return {ok:true,token:peer.token,authorId,history,musicPlayback,musicQueue,musicUploads};
   });
+  if (musicQueue || musicUploads) {
+    handle(musicQueue ? "music_queue_get" : "music_library_get",async ({afterTrackId,includeUsage})=>{
+      const snapshot=await storage.music.snapshot(peer.room,afterTrackId);
+      const usage=includeUsage ? await storage.roomUsage(peer.room) : undefined;
+      if (!musicQueue) {
+        const {tracks,revision,nextTrackCursor}=snapshot;
+        return {ok:true,snapshot:{tracks,revision,nextTrackCursor,queue:[]},usage};
+      }
+      return {ok:true,snapshot,usage};
+    },true);
+  }
   if (musicQueue) {
-    handle("music_queue_get",async ({afterTrackId})=>({
-      ok:true,snapshot:await storage.music.snapshot(peer.room,afterTrackId)
-    }),true);
     handle("music_queue_command",async data=>{
       const room=peer.room;
+      if (data.action==="deleteTrack" && !musicUploads) return {ok:false,error:"Library changes are disabled."};
       const result=await storage.music.queueCommand(room,data,()=>socket.connected && sessions.get(peer.token)===peer);
       if (result.ok && !result.replayed) {
         io.to(channel(room)).emit("music_queue_changed",{revision:result.appliedRevision});

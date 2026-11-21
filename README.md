@@ -111,7 +111,7 @@ Success returns `{ok, replayed, appliedRevision, snapshot}`. If the acknowledgem
 
 ### Synchronized room playback
 
-Set `CHATCODE_MUSIC_PLAYBACK=1` on a single server instance to enable playback. It defaults to off. Playback enables authorized GETs for existing MP3s. Uploading and editing the queue retain their independent flags. All joined members can control the shared transport. Listening is a local choice in room details. Muting a device leaves the room playing for other listeners.
+Set `CHATCODE_MUSIC_PLAYBACK=1` on a single server instance to enable playback. It defaults to off. Playback enables authorized GETs for existing MP3s. Uploading and editing the queue retain their independent flags. All joined members can control the shared transport. The mini-player above the composer stays mounted while members switch between Chat and Music. **Listen Together** joins audio on this device. Select **Listening** to leave. Expand the player for previous, next, seek, device volume and mute. The shared play button controls the room even when the member is not listening.
 
 | Socket.IO event | Contract |
 |---|---|
@@ -124,9 +124,18 @@ Set `CHATCODE_MUSIC_PLAYBACK=1` on a single server instance to enable playback. 
 
 The last member's departure freezes the room at its departure position. On startup, all sessions have ended, so recovery pauses any persisted playing entry at its elapsed position, capped at the track duration. A crash cannot establish the exact instant a device last produced sound. Membership and timers are process-local, as in the existing chat.
 
-An opted-in browser fetches the encrypted track with its live session token and decrypts it to a temporary Blob in a script-free, Blob-only audio frame. The client estimates server time using the lowest round trip of three samples, checks local media time every 250 ms, and seeks when the difference exceeds 120 ms. Changing tracks, muting or disconnecting releases the local audio. A reconnect obtains a fresh token, snapshot and clock sample. Browsers that require another gesture show **Start room audio**.
+An opted-in browser fetches the encrypted track with its live session token and decrypts it to a temporary Blob in a script-free, Blob-only audio frame. The client estimates server time using the lowest round trip of three samples, checks local media time every 250 ms, and seeks when the difference exceeds 120 ms. Changing to a different MP3, leaving local listening or disconnecting releases the local Blob. Muting retains the loaded track. A paused selection waits until playback starts before downloading a new track. A reconnect obtains a fresh token, snapshot and clock sample. Browsers that require another gesture show **Start room audio**.
 
 For the optional two-browser test, point `CHATCODE_TEST_WEBDRIVER` at a local ChromeDriver, optionally set `CHATCODE_TEST_CHROMIUM` to the Chromium executable, and run `npm test`. As with the other integration tests, use only a disposable database for `CHATCODE_TEST_DATABASE_URL`. The browser check measures foreground media clocks after an induced seek error. The 500 ms release target also needs two physical foreground devices and their audio outputs checked on the intended network.
+
+### Room music on mobile and desktop
+
+Enable `CHATCODE_MUSIC_UPLOADS=1`, `CHATCODE_MUSIC_QUEUE=1` and `CHATCODE_MUSIC_PLAYBACK=1` together for the full interface. Each defaults to off. **Music** opens the shared collection. **Chat** returns to messages and the draft. The header shows the room connection. Reconnecting disables edits until the socket rejoins.
+
+- **Library** accepts MP3s up to 10 MiB each. Upload progress includes encryption, transfer and validation. The meter shows the room’s charged chat, music and pending cleanup bytes against its 40 MiB limit. A service-wide limit can also restrict uploads.
+- Use **Add to queue** beside a library track. In **Queue**, select the track name to cue it paused. Its actions menu offers **Move up**, **Move down** and **Remove from queue**. In **Library**, **Delete from library** requires confirmation and removes the track and all its queue entries. This requires both the upload and queue flags and uses the existing room revision, receipt and cleanup transaction.
+- The join acknowledgement advertises the three capabilities. A queue reader may request `includeUsage` on `music_queue_get` to receive room `used` and `limit` bytes. With uploads enabled alone, `music_library_get` exposes the paged library and usage. A `music_library_changed` notification follows track publication. The existing queue command accepts `deleteTrack` with a `trackId`.
+- The browser test uses the actual player in desktop and phone-sized Chromium sessions. It exercises uploads, queue edits, track switching, scrolling, local audio settings, Blob release and recovery. Physical audio latency, hardware volume controls and mobile operating-system interruptions require device checks.
 
 ### Manually releasing and checking video
 

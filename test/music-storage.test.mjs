@@ -306,6 +306,26 @@ test("music storage migration and lifecycle", async t => {
     assert.equal((await music.playbackSnapshot(code)).current_entry,a.entry_id);
   });
 
+  await t.test("confirmed library deletion shares receipts and preserves the room charge until cleanup",async()=>{
+    const code="ui-library-delete", other="ui-usage-empty", music=store.music, trackId=randomUUID();
+    const bytes=track.sizeBytes+28;
+    await music.saveUpload(code,trackId,track,Buffer.alloc(bytes),()=>true);
+    const command=(action,expectedRevision,args)=>({action,expectedRevision,commandId:randomUUID(),...args});
+    await music.queueCommand(code,command("add","1",{trackId}));
+    await music.playbackCommand(code,command("play","2"));
+    const remove=command("deleteTrack","3",{trackId});
+    assert.deepEqual(await store.roomUsage(code),{used:bytes,limit:40*1024*1024});
+    assert.equal((await store.roomUsage(other)).used,0);
+    let checks=0;
+    await assert.rejects(music.queueCommand(code,remove,()=>++checks===1),/Join this room/);
+    assert.equal((await music.snapshot(code)).playing,true);
+    assert.ok((await music.queueCommand(code,remove)).ok);
+    assert.ok((await music.queueCommand(code,remove)).replayed);
+    const state=await music.snapshot(code);
+    assert.deepEqual([state.tracks,state.queue,state.current_entry,state.playing],[[],[],null,false]);
+    assert.equal((await store.roomUsage(code)).used,bytes);
+  });
+
   await t.test("room-scoped catalog pages and the queue capacity bound preserve complete ordered snapshots",async()=>{
     const code="paged-queue", room=createHash("sha256").update(code).digest("hex");
     await inspect(async db=>{

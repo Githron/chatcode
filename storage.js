@@ -89,14 +89,18 @@ export async function openStorage({enableMusicStorage = false} = {}) {
     await lockBudget(tx);
     for (const statement of musicMigration) await tx.query(statement);
   });
-  async function checkSpace(tx, room, size) {
+  async function budgetUsage(tx, room, localOnly=false) {
     const {rows} = await query(tx,"check_budget",`SELECT sum(byte_count) AS total,
       sum(byte_count) FILTER (WHERE room=$1) AS local FROM (
         SELECT byte_count, room FROM chatcode_messages WHERE byte_count>0
         UNION ALL SELECT byte_count, room FROM chatcode_music_tracks
         UNION ALL SELECT byte_count, room FROM chatcode_object_cleanup
-      ) usage`, [room]);
-    if (Number(rows[0].total) + size > budget || Number(rows[0].local) + size > 40 * MiB) {
+      ) usage ${localOnly ? "WHERE room=$1" : ""}`, [room]);
+    return {total:Number(rows[0].total),used:Number(rows[0].local),limit:40 * MiB};
+  }
+  async function checkSpace(tx, room, size) {
+    const {total,used,limit}=await budgetUsage(tx,room);
+    if (total + size > budget || used + size > limit) {
       const error = new Error("Attachment storage is full. You can still send text.");
       error.publicMessage = error.message;
       throw error;
@@ -144,6 +148,10 @@ export async function openStorage({enableMusicStorage = false} = {}) {
       clearInterval(interval);
       await cleaning;
       await db.close();
+    },
+    async roomUsage(code) {
+      const {used,limit}=await budgetUsage(db,roomId(code),true);
+      return {used,limit};
     },
     checkUploadSpace: (code, size) => checkSpace(db, roomId(code), size),
     async history(code) {

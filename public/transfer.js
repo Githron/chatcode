@@ -27,15 +27,15 @@ export async function decodeText(key, encoded) {
   try { return new TextDecoder().decode(await unseal(key,Uint8Array.from(atob(encoded),c=>c.charCodeAt(0)))); }
   catch { return "Unable to decrypt this message."; }
 }
-export async function upload(file,key,token,signal,progress) {
-  progress("Encrypting attachment…",0);
+export async function upload(file,key,token,signal,progress,path="/api/files") {
+  progress(path==="/api/files" ? "Encrypting attachment…" : "Encrypting MP3…",0);
   const data = await seal(key,await file.arrayBuffer());
   signal.throwIfAborted();
   return new Promise((resolve,reject) => {
     const req = new XMLHttpRequest();
     const abort = () => req.abort();
     signal.addEventListener("abort",abort,{once:true});
-    req.open("POST","/api/files");
+    req.open("POST",path);
     req.timeout=90000;
     req.setRequestHeader("Authorization","Bearer "+token);
     req.setRequestHeader("Content-Type","application/octet-stream");
@@ -45,7 +45,7 @@ export async function upload(file,key,token,signal,progress) {
       const percent=e.lengthComputable ? Math.round(100*e.loaded/e.total) : 0;
       progress(percent===100 ? "Checking file…" : "Uploading "+percent+"%",percent);
     };
-    req.onload=()=>req.status===201 ? resolve(req.response) : reject(new Error(req.response?.error || "Upload failed. Try again."));
+    req.onload=()=>(req.status===201 || (path==="/api/music/tracks" && req.status===200)) ? resolve(req.response) : reject(new Error(req.response?.error || "Upload failed. Try again."));
     req.onerror=req.ontimeout=()=>reject(new Error("Upload interrupted. Your attachment is ready to retry."));
     req.onabort=()=>reject(new Error("Upload canceled."));
     req.onloadend=()=>signal.removeEventListener("abort",abort);

@@ -738,12 +738,11 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
     assert.equal(end.playing,false);
     assert.deepEqual(foreign,[]);
     if (process.env.CHATCODE_TEST_WEBDRIVER) {
+      musicEnabled=queueEnabled=true;
+      await restart();
       const {playbackBrowser}=await import("./test/playback-browser.mjs");
       await pt.test("two foreground browsers follow the room after drift, autoplay denial and reconnect",
-        bt=>playbackBrowser(bt,url,room,command,async()=>{
-          await restart(Number(new URL(url).port));
-          a=await connect(); await join(a,"Conductor",room);
-        },{"test.png":png,"clip.mp4":mp4,"clip.webm":webm}));
+        bt=>playbackBrowser(bt,url,room+"-ui",bytes,()=>restart(Number(new URL(url).port)),{"test.png":png,"clip.mp4":mp4,"clip.webm":webm}));
     }
   });
 

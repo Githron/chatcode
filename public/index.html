@@ -5,6 +5,7 @@
   <meta name="theme-color" content="#191a1b"><title>ChatCode — Room messenger</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23ed4436'/%3E%3Cpath d='M7 9h18v11H13l-6 5z' fill='%23191a1b'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/music-player.css">
 </head>
 <body>
 <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
@@ -22,7 +23,16 @@
 <symbol id="i-chat" viewBox="0 0 24 24"><path d="M3 4h18v13H9l-6 4V4Zm4 5h10m-10 4h6"/></symbol>
 <symbol id="i-lock" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></symbol>
 <symbol id="i-copy" viewBox="0 0 24 24"><path d="M9 8h11v13H9zM5 16H3V3h12v2"/></symbol>
-<symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v16m-6-6 6 6 6-6"/></symbol></svg>
+<symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v16m-6-6 6 6 6-6"/></symbol>
+<symbol id="i-music" viewBox="0 0 24 24"><path d="M9 17V5l11-2v12M9 8l11-2 M9 17c0 4-7 5-7 1 0-3 7-5 7-1Zm11-2c0 4-7 5-7 1 0-3 7-5 7-1Z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8Z"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14m8-14v14"/></symbol>
+<symbol id="i-next" viewBox="0 0 24 24"><path d="M5 5l11 7-11 7Zm14 0v14"/></symbol>
+<symbol id="i-previous" viewBox="0 0 24 24"><path d="M19 5L8 12l11 7ZM5 5v14"/></symbol>
+<symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 14 6-6 6 6"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><path d="M4 12h1m6 0h1m6 0h1"/></symbol>
+</svg>
 <main id="join-screen" class="entry">
   <section class="poster" aria-label="ChatCode">
     <span class="brand"><span class="brand-mark" aria-hidden="true"></span>Chat<span class="brand-end">Code</span></span>
@@ -49,16 +59,43 @@
     <div class="rail-top"><span class="brand"><span class="brand-mark" aria-hidden="true"></span>Chat<span class="brand-end">Code</span></span><button id="drawer-close" class="icon-button mobile" aria-label="Close room details"><svg class="icon" aria-hidden="true"><use href="#i-close"></use></svg></button></div>
     <div class="room-box"><span class="room-glyph"><svg class="icon" aria-hidden="true"><use href="#i-hash"></use></svg></span><div><small>Current room</small><strong id="room-display"></strong></div><button id="copy" class="icon-button" aria-label="Copy room code" title="Copy room code"><svg class="icon" aria-hidden="true"><use href="#i-copy"></use></svg></button></div>
     <div class="list-title">Members <span id="user-count"></span></div><ul id="members-list"></ul>
-    <div class="rail-actions"><button id="listen-btn" type="button" aria-pressed="false" hidden>Listen to room music</button><button id="resume-audio" type="button" hidden>Start room audio</button><button id="clear-btn"><svg class="icon" aria-hidden="true"><use href="#i-clear"></use></svg>Clear conversation</button><button id="leave-btn"><svg class="icon" aria-hidden="true"><use href="#i-leave"></use></svg>Leave room</button></div>
+    <div class="rail-actions"><button id="clear-btn"><svg class="icon" aria-hidden="true"><use href="#i-clear"></use></svg>Clear conversation</button><button id="leave-btn"><svg class="icon" aria-hidden="true"><use href="#i-leave"></use></svg>Leave room</button></div>
   </aside>
   <button type="button" id="backdrop" aria-label="Close room details" tabindex="-1" hidden></button>
   <main class="chat-main" id="main-room">
-    <header class="chat-header"><div class="channel-mark"><svg class="icon" aria-hidden="true"><use href="#i-hash"></use></svg></div><div class="header-title"><h1 id="header-room"></h1><span id="network" role="status"></span></div><button id="menu-toggle" class="icon-button mobile" aria-controls="sidebar" aria-expanded="false" aria-label="Room members and settings"><svg class="icon" aria-hidden="true"><use href="#i-people"></use></svg></button></header>
+    <header class="chat-header"><div class="channel-mark"><svg class="icon" aria-hidden="true"><use href="#i-hash"></use></svg></div><div class="header-title"><h1 id="header-room"></h1><span id="network" role="status"></span></div><button id="music-view-toggle" class="music-switch" aria-expanded="false" aria-controls="room-music" hidden><svg class="icon" aria-hidden="true"><use href="#i-music"></use></svg><span>Music</span></button><button id="menu-toggle" class="icon-button mobile" aria-controls="sidebar" aria-expanded="false" aria-label="Room members and settings"><svg class="icon" aria-hidden="true"><use href="#i-people"></use></svg></button></header>
     <p id="history-status" class="history-status" role="status" hidden>Loading room history…</p>
     <div id="history" class="history" tabindex="0" aria-label="Conversation history">
       <div id="empty" class="empty"><span class="empty-mark"><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg></span><h2>Start the conversation<span class="stop">.</span></h2><p>Send a message or share a file with this room.</p></div>
       <div id="messages" role="log" aria-label="Messages" aria-live="polite" aria-relevant="additions"></div>
     </div>
+    <section id="room-music" aria-labelledby="music-heading" hidden>
+      <div class="music-page">
+        <div class="music-heading"><h2 id="music-heading" tabindex="-1">Room music</h2><button id="music-upload" class="primary" type="button"><svg class="icon" aria-hidden="true"><use href="#i-plus"></use></svg> Upload MP3</button></div>
+        <input id="music-file" type="file" accept=".mp3,audio/mpeg" hidden>
+        <div class="music-storage"><span id="music-usage">Loading room storage…</span><meter id="music-meter" min="0" max="1" value="0" aria-label="Room storage used" hidden></meter></div>
+        <p class="music-limit" id="music-limit">MP3 files up to 10 MiB</p>
+        <div id="music-transfer" hidden><progress max="100" value="0" aria-label="MP3 upload progress"></progress><span id="music-transfer-label" role="status"></span></div>
+        <div class="music-views" role="group" aria-label="Music collection"><button id="show-queue" aria-pressed="true">Queue</button><button id="show-library" aria-pressed="false">Library</button></div>
+        <p id="music-feedback" role="status"></p>
+        <div id="music-collection" aria-busy="false"><p id="music-empty"></p><ol id="music-tracks"></ol>
+        <button id="more-tracks" class="music-switch" hidden>Load more tracks</button></div>
+      </div>
+    </section>
+    <section id="mini-player" aria-label="Shared music player" hidden>
+      <div class="player-main"><button id="music-play" class="transport-play" aria-label="Play for room" disabled><svg class="icon" aria-hidden="true"><use href="#i-play"></use></svg></button>
+        <div class="player-track"><strong id="playing-name">Room music</strong><small id="playing-detail">Connecting…</small></div>
+        <button id="listen-btn" type="button" aria-pressed="false">Listen Together</button>
+        <button id="player-toggle" class="icon-button" aria-label="Expand player" aria-expanded="false" aria-controls="player-controls"><svg class="icon" aria-hidden="true"><use href="#i-chevron"></use></svg></button>
+      </div>
+      <button id="resume-audio" class="music-switch" hidden>Start room audio on this device</button>
+      <div id="player-controls" hidden>
+        <div class="music-seek"><button id="music-previous" class="icon-button" aria-label="Previous track"><svg class="icon" aria-hidden="true"><use href="#i-previous"></use></svg></button>
+          <input id="music-seek" type="range" min="0" max="0" step="1" value="0" aria-label="Seek for room">
+          <button id="music-next" class="icon-button" aria-label="Next track"><svg class="icon" aria-hidden="true"><use href="#i-next"></use></svg></button></div>
+        <div class="device-volume"><label for="music-volume">Device volume</label><input id="music-volume" type="range" min="0" max="100" value="100"><button id="music-mute" aria-pressed="false">Mute</button></div>
+      </div>
+    </section>
     <div class="composer-wrap">
       <button id="latest" class="latest" hidden><svg class="icon" aria-hidden="true"><use href="#i-down"></use></svg>New messages</button>
       <div id="typing" class="typing"></div>

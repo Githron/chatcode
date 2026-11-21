@@ -55,10 +55,10 @@ const emptyState = {revision:"0", current_entry:null, position_ms:0, playing:fal
 
 async function playbackState(db, room) {
   const {rows}=await db.query(`SELECT p.revision::text,p.current_entry,p.position_ms,p.playing,p.anchor_time,
-    q.track_id,t.duration_ms FROM chatcode_music_playback p
+    q.track_id,t.duration_ms,t.filename FROM chatcode_music_playback p
     LEFT JOIN chatcode_music_queue q ON q.room=p.room AND q.entry_id=p.current_entry
     LEFT JOIN chatcode_music_tracks t ON t.room=q.room AND t.track_id=q.track_id WHERE p.room=$1`,[room]);
-  return rows[0] || {...emptyState,track_id:null,duration_ms:null};
+  return rows[0] || {...emptyState,track_id:null,duration_ms:null,filename:null};
 }
 
 function positionAt(state, now) {
@@ -125,9 +125,19 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
     });
   }
 
+  async function deleteTrack(tx,room,trackId) {
+    const entries = await tx.query("SELECT entry_id FROM chatcode_music_queue WHERE room=$1 AND track_id=$2", [room, trackId]);
+    await resetCurrent(tx, room, entries.rows.map(row => row.entry_id));
+    const removed = await tx.query(`DELETE FROM chatcode_music_tracks WHERE room=$1 AND track_id=$2
+      RETURNING room, object_key, byte_count`, [room, trackId]);
+    if (!removed.rows.length) throw new Error("Music track unavailable.");
+    await collectKeys(tx, removed.rows);
+  }
+
   async function commitCommand(code, input, stillJoined, playback) {
     const command=parseQueueCommand(input,playback), room=roomId(code);
     return db.transaction(async tx=>{
+      if (command.action==="deleteTrack") await lockBudget(tx);
       // Track publication creates the playback row. A rejected command in an empty room needs no writes.
       const revision=await lockedRevision(tx,room);
       if (!stillJoined()) throw queueError("Join this room first.");
@@ -144,6 +154,7 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
       }
       if (revision!==command.expectedRevision) return {ok:false,code:"stale_revision"};
       if (playback) await applyPlayback(tx,room,command);
+      else if (command.action==="deleteTrack") await deleteTrack(tx,room,command.argument);
       else await applyQueueEdit(tx,room,command);
       const appliedRevision=await advanceRevision(tx,room);
       await tx.query(`INSERT INTO chatcode_music_queue_commands(room,command_id,fingerprint,applied_revision)
@@ -294,12 +305,7 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
 
     removeTrack(code, revision, trackId) {
       return edit(code, revision, async (tx, room) => {
-        const entries = await tx.query("SELECT entry_id FROM chatcode_music_queue WHERE room=$1 AND track_id=$2", [room, trackId]);
-        await resetCurrent(tx, room, entries.rows.map(row => row.entry_id));
-        const removed = await tx.query(`DELETE FROM chatcode_music_tracks WHERE room=$1 AND track_id=$2
-          RETURNING room, object_key, byte_count`, [room, trackId]);
-        if (!removed.rows.length) throw new Error("Music track unavailable.");
-        await collectKeys(tx, removed.rows);
+        await deleteTrack(tx,room,trackId);
       }, true);
     }
   };

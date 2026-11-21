@@ -22,6 +22,7 @@ export function parseQueueCommand(input, playback=false) {
     if (!["play","pause","next","previous","seek"].includes(action)) throw queueError("Unknown playback action.");
     if (action==="seek") field="positionMs";
   } else switch (action) {
+    case "deleteTrack":
     case "add": field="trackId"; break;
     case "select":
     case "remove": field="entryId"; break;
