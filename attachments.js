@@ -119,11 +119,11 @@ export function stagedFile(id, peer) {
 
 export function releaseFile(id) { files.delete(id); }
 
-export function attachmentRoutes(app, sessions, storage) {
+export function attachmentRoutes(app, sessions, storage, music=storage.music) {
   let recentUploads = [];
   const musicPath="/api/music/tracks";
-  const uploadPaths=storage.music ? ["/api/files",musicPath] : ["/api/files"];
-  if (storage.music) app.use(musicPath,(req,res,next)=>{req.musicUpload=true; next();});
+  const uploadPaths=music ? ["/api/files",musicPath] : ["/api/files"];
+  if (music) app.use(musicPath,(req,res,next)=>{req.musicUpload=true; next();});
   app.use(uploadPaths, (req, res, next) => {
     res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
     const peer = sessions.get((req.get("Authorization") || "").replace(/^Bearer /, ""));
@@ -181,7 +181,7 @@ export function attachmentRoutes(app, sessions, storage) {
         plaintext.fill(0); key.fill(0);
         if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
         try {
-          const created=await storage.music.saveUpload(peer.room,id,{filename:name,sizeBytes,durationMs},bytes,stillJoined);
+          const created=await music.saveUpload(peer.room,id,{filename:name,sizeBytes,durationMs},bytes,stillJoined);
           if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
           return res.status(created?201:200).json({id,name,type:"audio/mpeg",size:sizeBytes,durationMs});
         } catch (err) {
@@ -214,7 +214,7 @@ export function attachmentRoutes(app, sessions, storage) {
       res.set("Content-Disposition","attachment").type("application/octet-stream").send(bytes);
     } catch {res.status(503).json({error:"File storage is unavailable. Please retry."});}
   });
-  if (storage.music) {
+  if (music) {
     const reads=new Set();
     app.get(musicPath+"/:id",async (req,res)=>{
       const {peer}=req;
@@ -223,7 +223,7 @@ export function attachmentRoutes(app, sessions, storage) {
       if (reads.size>=4 || reads.has(peer.token)) return res.status(429).json({error:"Music downloads are busy. Retry shortly."});
       reads.add(peer.token);
       try {
-        const bytes=await storage.music.readTrack(peer.room,req.params.id);
+        const bytes=await music.readTrack(peer.room,req.params.id);
         if (!bytes || sessions.get(peer.token)!==peer) return res.status(404).json({error:"Track unavailable."});
         if (res.destroyed) return;
         res.set("Content-Disposition","attachment").type("application/octet-stream").send(bytes);

@@ -75,7 +75,7 @@ Filter Render logs for `storage_failure` at the time of the failed send. The `op
 
 ### Private room music storage and transfer
 
-The server creates the music schema on startup. Music transfer is disabled by default. For local testing with private R2 settings, `CHATCODE_MUSIC_UPLOADS=1` registers the two HTTP routes below. Any other value leaves them unregistered. The flag adds no browser or queue controls.
+The server creates the music schema on startup. Music transfer is disabled by default. For local testing with private R2 settings, `CHATCODE_MUSIC_UPLOADS=1` registers the two HTTP routes below. Queue commands have an independent switch.
 
 | Endpoint | Contract |
 |---|---|
@@ -90,7 +90,24 @@ Tracks belong to the room independently of chat messages. Queue entries have sta
 
 The service reserves capacity before the private R2 PUT and publishes metadata after confirming the object exists. The object key stays server-side. Abandoned reservations expire after one hour. Publication transfers their charge to the track atomically. Deletion transfers the charge to the cleanup queue until R2 confirms removal. Tracks use the existing 40 MiB room and configurable service budgets, including 28 encryption bytes per track. Sum the attachment, music and pending-byte results in `storage-usage.sql`.
 
-The migration adds three tables, their indexes, and a nullable indexed music reservation ID on the cleanup table. Existing message rows and R2 keys require no backfill. Before a future release, rehearse on a restored backup and allow for a short schema lock at startup. For rollback, retain the additive schema and keep music writers disabled. An older binary omits published music from its quota calculation, so retain the updated accounting or suspend new media uploads if any tracks exist. Dropping music tables would discard object ownership and playlist state.
+The music migrations add track, queue-entry, playback and command-receipt tables, their indexes, and a nullable indexed music reservation ID on the cleanup table. Existing message rows and R2 keys require no backfill. Before a future release, rehearse on a restored backup and allow for a short schema lock at startup. For rollback, retain the additive schema and keep music writers disabled. An older binary omits published music from its quota calculation, so retain the updated accounting or suspend new media uploads if any tracks exist. Dropping music tables would discard object ownership and playlist state.
+
+### Shared room queue
+
+`CHATCODE_MUSIC_QUEUE=1` registers two Socket.IO events for joined room members. The default is off. The queue can manage previously uploaded tracks while uploads are disabled. Uploading adds a track to the room library. A separate command adds it to the queue.
+
+- After a successful join or reconnect, request `music_queue_get` with `{room}`. The acknowledgement contains `ok` and `snapshot`. The snapshot includes the revision as a decimal string, current selection, playback state, the complete ordered queue, and up to 100 room tracks. Pass `afterTrackId: snapshot.nextTrackCursor` for the next library page. A null cursor ends the list. Restart pagination if the revision changes between pages.
+- Send `music_queue_command` with `room`, a fresh UUID in `commandId`, the snapshot's `expectedRevision`, and one action from the table below. The server uses the joined socket's room for every query. Each accepted edit increments the room revision once.
+- Each committed edit emits `music_queue_changed` with its `revision` to members of that room. Subscribe before fetching the snapshot, refresh when notified of a newer revision and discard older snapshots. Compare revisions as integers (for example, with `BigInt`).
+
+| Action | Required argument | Effect |
+|---|---|---|
+| `add` | `trackId` | Append a new entry for a room track. Multiple entries may reference the same track. The queue holds up to 256 entries. |
+| `remove` | `entryId` | Remove one occurrence. Removing the selected entry clears selection, position and time anchor, and pauses playback. The track remains in the library. |
+| `reorder` | `entryIds` | Supply every current entry ID exactly once in its new order. Entry identities and selection survive reordering. |
+| `select` | `entryId` | Select the entry at position zero, paused. |
+
+Success returns `{ok, replayed, appliedRevision, snapshot}`. If the acknowledgement is lost, resend the **identical command**, including its original revision, after rejoining. A durable receipt recovers the originally applied revision along with a fresh snapshot. A stale edit returns `ok: false`, `code: "stale_revision"` and the current snapshot. Reconcile the intended change before sending a new command ID. Changing the contents of an already applied command ID returns `command_id_reused`. Only successful edits consume IDs. Receipts are room-scoped and retained independently of chat history, so their database usage grows with accepted edits.
 
 ### Manually releasing and checking video
 

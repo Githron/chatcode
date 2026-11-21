@@ -117,20 +117,22 @@ test("music storage migration and lifecycle", async t => {
 
   await t.test("serialize competing edits, reorder and restrict all queue and player references to the room", async () => {
     const music=store.music, id=handle.trackId;
-    const race=await Promise.allSettled([music.enqueue(room,"1",id),music.enqueue(room,"1",id)]);
-    assert.deepEqual(race.filter(r=>r.status==="fulfilled").map(r=>r.value),["2"]);
-    assert.match(race.find(r=>r.status==="rejected").reason.message,/revision/);
-    await assert.rejects(music.enqueue(other,"0",id),{code:"23503"});
-    assert.equal(await music.enqueue(room,"2",id),"3");
+    const edit=(code,expectedRevision,action,fields)=>music.queueCommand(code,{commandId:randomUUID(),expectedRevision,action,...fields});
+    const add=(code,revision)=>edit(code,revision,"add",{trackId:id});
+    const race=await Promise.all([add(room,"1"),add(room,"1")]);
+    assert.deepEqual(race.filter(r=>r.ok).map(r=>r.appliedRevision),["2"]);
+    assert.equal(race.find(r=>!r.ok).code,"stale_revision");
+    await assert.rejects(add(other,"0"),/unavailable/);
+    assert.equal((await add(room,"2")).appliedRevision,"3");
     const [a,b]=(await music.snapshot(room)).queue.map(e=>e.entry_id);
-    await assert.rejects(music.reorder(room,"3",[b,b]),/order/);
-    assert.equal(await music.reorder(room,"3",[b,a]),"4");
+    await assert.rejects(edit(room,"3","reorder",{entryIds:[b,b]}),/order/);
+    assert.equal((await edit(room,"3","reorder",{entryIds:[b,a]})).appliedRevision,"4");
     assert.deepEqual((await music.snapshot(room)).queue.map(e=>e.entry_id),[b,a]);
     await assert.rejects(music.setPlayback(other,"0",{entryId:a,positionMs:0,playing:true}),/entry/);
     await assert.rejects(music.setPlayback(room,"4",{entryId:a,positionMs:91001,playing:true}),/position/);
     assert.equal(await music.setPlayback(room,"4",{entryId:a,positionMs:1050,playing:true}),"5");
-    assert.equal(await music.removeEntry(room,"5",b),"6");
-    assert.equal(await music.enqueue(room,"6",id),"7");
+    assert.equal((await edit(room,"5","remove",{entryId:b})).appliedRevision,"6");
+    assert.equal((await add(room,"6")).appliedRevision,"7");
     snapshot=await music.snapshot(room);
     assert.equal(snapshot.current_entry,a);
     assert.equal(snapshot.position_ms,1050);
@@ -235,5 +237,68 @@ test("music storage migration and lifecycle", async t => {
     await store.music.saveUpload(code,id,track,Buffer.alloc(first.length,2),()=>true);
     assert.deepEqual(await store.music.readTrack(code,id),first);
     assert.equal((await store.music.snapshot(code)).revision,"1");
+  });
+
+  await t.test("queue receipts commit once, roll back with revoked edits and survive selection removal",async()=>{
+    const music=store.music, code="queue-receipts", trackId=randomUUID();
+    await music.saveUpload(code,trackId,track,Buffer.alloc(track.sizeBytes+28),()=>true);
+    const add={commandId:randomUUID(),expectedRevision:"1",action:"add",trackId};
+    const results=await Promise.all([music.queueCommand(code,add),music.queueCommand(code,add)]);
+    assert.deepEqual(results.map(r=>r.replayed).sort(),[false,true]);
+    const snapshot=await music.snapshot(code);
+    assert.equal(snapshot.queue.length,1);
+    const entryId=snapshot.queue[0].entry_id;
+    const outsiderRoom="other-queue-receipts", outsiderTrack=randomUUID();
+    await music.saveUpload(outsiderRoom,outsiderTrack,track,Buffer.alloc(track.sizeBytes+28),()=>true);
+    await music.queueCommand(outsiderRoom,{...add,trackId:outsiderTrack});
+    const outsiderState=await music.snapshot(outsiderRoom);
+    for (const fields of [{action:"select",entryId},{action:"remove",entryId},{action:"reorder",entryIds:[entryId]}]) {
+      await assert.rejects(music.queueCommand(outsiderRoom,{commandId:randomUUID(),expectedRevision:"2",...fields}),/unavailable|order/);
+    }
+    assert.deepEqual(await music.snapshot(outsiderRoom),outsiderState);
+    await music.setPlayback(code,"2",{entryId,positionMs:1500,playing:true});
+    const remove={commandId:randomUUID(),expectedRevision:"3",action:"remove",entryId};
+    let checks=0;
+    await assert.rejects(music.queueCommand(code,remove,()=>++checks===1),/Join this room/);
+    const before=await music.snapshot(code);
+    assert.equal(before.revision,"3");
+    assert.equal(before.playing,true);
+    assert.equal(before.current_entry,entryId);
+    assert.equal(before.position_ms,1500);
+    assert.equal((await music.queueCommand(code,remove)).replayed,false);
+    const after=await music.snapshot(code);
+    assert.equal(after.revision,"4");
+    assert.deepEqual(after.queue,[]);
+    assert.equal(after.current_entry,null);
+    assert.equal(after.anchor_time,null);
+    assert.equal(after.position_ms,0);
+    assert.equal(after.playing,false);
+    assert.equal(after.tracks.length,1);
+    assert.equal((await music.queueCommand(code,add)).appliedRevision,"2");
+    assert.equal((await music.queueCommand(code,{...add,expectedRevision:"4"})).code,"command_id_reused");
+    assert.equal((await music.snapshot(code)).revision,"4");
+  });
+
+  await t.test("room-scoped catalog pages and the queue capacity bound preserve complete ordered snapshots",async()=>{
+    const code="paged-queue", room=createHash("sha256").update(code).digest("hex");
+    await inspect(async db=>{
+      await db.query("INSERT INTO chatcode_music_playback(room) VALUES ($1)",[room]);
+      await db.query(`INSERT INTO chatcode_music_tracks(room,track_id,object_key,filename,size_bytes,duration_ms)
+        SELECT $1,md5(i::text)::uuid,'chatcode/r2/'||md5(i::text),'tone.mp3',64,1000 FROM generate_series(1,101) AS i`,[room]);
+      await db.query(`INSERT INTO chatcode_music_queue(room,entry_id,track_id,position)
+        SELECT $1,md5(i::text)::uuid,md5('1')::uuid,i FROM generate_series(1,256) AS i`,[room]);
+    });
+    await start();
+    const first=await store.music.snapshot(code);
+    assert.equal(first.tracks.length,100);
+    assert.equal(first.queue.length,256);
+    const second=await store.music.snapshot(code,first.nextTrackCursor);
+    assert.equal(second.nextTrackCursor,null);
+    assert.equal(second.tracks.length,1);
+    assert.deepEqual(second.queue,first.queue);
+    assert.equal(new Set([...first.tracks,...second.tracks].map(t=>t.track_id)).size,101);
+    await assert.rejects(store.music.queueCommand(code,{commandId:randomUUID(),expectedRevision:"0",
+      action:"add",trackId:first.tracks[0].track_id}),/queue is full/);
+    assert.equal((await store.music.snapshot(code)).revision,"0");
   });
 });

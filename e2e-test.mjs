@@ -114,7 +114,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
   const objects=pathJoin(directory,"objects");
   await mkdir(objects);
   const account="a".repeat(32);
-  let backend="database",budget=128*1024*1024,pgOptions="",musicEnabled=false;
+  let backend="database",budget=128*1024*1024,pgOptions="",musicEnabled=false,queueEnabled=false;
   let stderr="";
   const start=()=>{
     const child=spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
@@ -124,7 +124,8 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
       AWS_ACCESS_KEY_ID:"legacy-test",AWS_SECRET_ACCESS_KEY:"fixture",AWS_SESSION_TOKEN:"",
       R2_ACCOUNT_ID:backend==="r2"?account:"",R2_ENDPOINT:backend==="r2"?"https://"+account+".r2.cloudflarestorage.com":"",
       R2_BUCKET_NAME:backend==="r2"?"test-r2":"",R2_ACCESS_KEY_ID:backend==="r2"?"r2-test":"",R2_SECRET_ACCESS_KEY:backend==="r2"?"fixture":"",
-      CHATCODE_MUSIC_UPLOADS:musicEnabled?"1":"",CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","pipe"]});
+      CHATCODE_MUSIC_UPLOADS:musicEnabled?"1":"",CHATCODE_MUSIC_QUEUE:queueEnabled?"1":"",
+      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","pipe"]});
     child.stderr.on("data",chunk=>{stderr+=chunk;process.stderr.write(chunk);});
     return child;
   };
@@ -542,5 +543,96 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     const accepted=await post(last.token,await seal(key,limit),"limit.mp3");
     assert.equal(accepted.status,201);
     assert.equal((await accepted.json()).size,fileLimit);
+  });
+
+  await t.test("shared queue commands converge across clients, lost acknowledgements and a server restart",async()=>{
+    const code="queue-"+randomUUID().slice(0,8), other=code+"-x";
+    const get=(client,room=code)=>request(client,"music_queue_get",{room});
+    const send=(client,data)=>request(client,"music_queue_command",data);
+    const command=(expectedRevision,action,fields)=>({room:code,commandId:randomUUID(),expectedRevision,action,...fields});
+    const disabled=await connect();
+    await join(disabled,"Before",code);
+    await assert.rejects(disabled.timeout(200).emitWithAck("music_queue_get",{room:code}),/timed out/);
+    queueEnabled=true; musicEnabled=true; backend="r2"; budget=128*1024*1024; pgOptions="";
+    await restart();
+    const a=await connect(), b=await connect(), x=await connect();
+    const invalid=command("0","add",{trackId:randomUUID()});
+    assert.equal((await get(a)).ok,false);
+    assert.equal((await send(a,invalid)).ok,false);
+    const member=await join(a,"Alice",code);
+    await join(b,"Bob",code); await join(x,"Casey",other);
+    const outsideEvents=[];
+    x.on("music_queue_changed",event=>outsideEvents.push(event));
+    const key=await roomKey(code), ids=[];
+    for (const [name,data] of [["first.mp3",mp3],["second.mp3",mono]]) {
+      const res=await fetch(url+"/api/music/tracks",{method:"POST",headers:{...auth(member.token),
+        "Content-Type":"application/octet-stream","X-File-Name":name},body:await seal(key,data)});
+      assert.equal(res.status,201);
+      ids.push((await res.json()).id);
+    }
+    const initial=(await get(b)).snapshot;
+    assert.equal(initial.revision,"2");
+    assert.deepEqual(initial.queue,[]);
+    assert.deepEqual(initial.tracks.map(t=>t.track_id).sort(),[...ids].sort());
+    assert.ok(!JSON.stringify(initial).includes("chatcode/r2/"));
+    const objectsBefore=(await readdir(objects)).sort();
+    await writeFile(pathJoin(objects,"offline"),"");
+    const first=command(initial.revision,"add",{trackId:ids[0]});
+    assert.equal((await send(x,first)).ok,false);
+    const foreign=await send(x,{...first,room:other,expectedRevision:"0"});
+    assert.equal(foreign.ok,false);
+    assert.deepEqual((await get(x,other)).snapshot.tracks,[]);
+    for (const bad of [{...first,commandId:null},{...first,expectedRevision:2},{...first,action:"play"}]) {
+      assert.equal((await send(a,bad)).ok,false);
+    }
+    const changed=next(b,"music_queue_changed");
+    const race=await Promise.all([send(a,first),send(b,{...first,commandId:randomUUID()})]);
+    const applied=race.find(r=>r.ok), stale=race.find(r=>!r.ok);
+    assert.equal(applied.appliedRevision,"3");
+    assert.equal(stale.code,"stale_revision");
+    assert.deepEqual(stale.snapshot,applied.snapshot);
+    assert.deepEqual(await changed,{revision:"3"});
+    const entry=applied.snapshot.queue[0].entry_id;
+    const lost=command("3","add",{trackId:ids[1]});
+    const delivered=next(b,"music_queue_changed");
+    a.emit("music_queue_command",lost); // Commit without supplying an acknowledgement callback.
+    assert.deepEqual(await delivered,{revision:"4"});
+    const duplicate=await send(b,lost);
+    assert.equal(duplicate.replayed,true);
+    const second=duplicate.snapshot.queue[1].entry_id;
+    const reused=await send(b,{...lost,expectedRevision:"4",action:"remove",trackId:undefined,entryId:entry});
+    assert.equal(reused.code,"command_id_reused");
+    assert.equal(reused.snapshot.revision,"4");
+    const incomplete=await send(a,command("4","reorder",{entryIds:[second]}));
+    assert.equal(incomplete.ok,false);
+    const reordered=await send(a,command("4","reorder",{entryIds:[second,entry]}));
+    assert.deepEqual(reordered.snapshot.queue.map(q=>q.entry_id),[second,entry]);
+    const selected=await send(b,command("5","select",{entryId:second}));
+    assert.equal(selected.snapshot.current_entry,second);
+    assert.equal(selected.snapshot.playing,false);
+    assert.ok((await request(a,"clear_chat",{room:code,confirm:true})).ok);
+    assert.deepEqual((await get(a)).snapshot,selected.snapshot);
+    b.disconnect();
+    const returning=await connect();
+    await join(returning,"Bob",code);
+    assert.deepEqual((await get(returning)).snapshot,selected.snapshot);
+    assert.deepEqual(outsideEvents,[]);
+    musicEnabled=false;
+    await restart();
+    const c=await connect(), fresh=await join(c,"Carol",code);
+    assert.equal((await fetch(url+"/api/music/tracks/"+ids[0],{headers:auth(fresh.token)})).status,404);
+    const replay=await send(c,lost);
+    assert.equal(replay.appliedRevision,"4");
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.snapshot,selected.snapshot);
+    const removed=await send(c,command("6","remove",{entryId:second}));
+    assert.equal(removed.snapshot.revision,"7");
+    assert.deepEqual(removed.snapshot.queue.map(q=>q.entry_id),[entry]);
+    assert.equal(removed.snapshot.current_entry,null);
+    assert.equal(removed.snapshot.position_ms,0);
+    assert.equal(removed.snapshot.anchor_time,null);
+    assert.equal(removed.snapshot.tracks.length,2);
+    await rm(pathJoin(objects,"offline"));
+    assert.deepEqual((await readdir(objects)).sort(),objectsBefore);
   });
 });

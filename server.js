@@ -8,8 +8,10 @@ import { attachmentRoutes, clearFiles, stagedFile, releaseFile } from "./attachm
 import { openStorage } from "./storage.js";
 import { MediaConfigurationError } from "./media-storage.js";
 
+const musicUploads=process.env.CHATCODE_MUSIC_UPLOADS==="1";
+const musicQueue=process.env.CHATCODE_MUSIC_QUEUE==="1";
 let storage;
-try {storage=await openStorage({enableMusicStorage:process.env.CHATCODE_MUSIC_UPLOADS==="1"});}
+try {storage=await openStorage({enableMusicStorage:musicUploads || musicQueue});}
 catch (err) {console.error(err instanceof MediaConfigurationError ? err.message : "History storage could not start. Check the database configuration and permissions.");process.exit(1);}
 const app = express();
 app.disable("x-powered-by");
@@ -18,7 +20,7 @@ const io = new Server(server, { maxHttpBufferSize: 24 * 1024 });
 const rooms = new Map();
 const sessions = new Map();
 const channel = code => "chatcode:" + code;
-attachmentRoutes(app, sessions, storage);
+attachmentRoutes(app, sessions, storage, musicUploads ? storage.music : null);
 app.use((req, res, next) => {
   res.set({ "X-Content-Type-Options":"nosniff", "Referrer-Policy":"no-referrer",
     "Content-Security-Policy":"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" });
@@ -51,7 +53,8 @@ function members(peer) {
 
 io.on("connection", socket => {
   let peer, pending=0;
-  function handle(event, action) {
+  let recentQueueRequests=[];
+  function handle(event, action, queueRequest=false) {
     socket.on(event, (data, ack) => {
       const answer = result => { if (typeof ack === "function") ack(result); };
       if (!data || typeof data !== "object") return answer({ok:false,error:"Invalid request."});
@@ -60,11 +63,21 @@ io.on("connection", socket => {
       if (event==="join_room" && (typeof data.room!=="string" || data.room.length>24))
         return answer({ok:false,error:"Invalid room code."});
       if(pending>=8)return answer({ok:false,error:"Please wait before trying again."});
+      if (queueRequest) {
+        const now=Date.now();
+        recentQueueRequests=recentQueueRequests.filter(time=>now-time<1000);
+        if (recentQueueRequests.length>=20) return answer({ok:false,error:"Please wait before trying again."});
+        recentQueueRequests.push(now);
+      }
       pending++;
-      inOrder(data.room,async()=>{
+      const run=async()=>{
         if(!socket.connected)return;
-        answer(await action(data));
-      }).catch(err=>answer({ok:false,error:err.publicMessage || "Room storage is unavailable. Please retry."})).finally(()=>pending--);
+        const result=await action(data);
+        if (socket.connected) answer(result);
+      };
+      // Queue order is committed by PostgreSQL independently of chat attachment PUTs.
+      const task=queueRequest ? run() : inOrder(data.room,run);
+      task.catch(err=>answer({ok:false,error:err.publicMessage || "Room storage is unavailable. Please retry."})).finally(()=>pending--);
     });
   }
   handle("join_room", async ({ username, room, identity }) => {
@@ -87,6 +100,19 @@ io.on("connection", socket => {
     socket.to(channel(room)).emit("user_joined",{message:username+" joined the room"});
     return {ok:true,token:peer.token,authorId,history};
   });
+  if (musicQueue) {
+    handle("music_queue_get",async ({afterTrackId})=>({
+      ok:true,snapshot:await storage.music.snapshot(peer.room,afterTrackId)
+    }),true);
+    handle("music_queue_command",async data=>{
+      const room=peer.room;
+      const result=await storage.music.queueCommand(room,data,()=>socket.connected && sessions.get(peer.token)===peer);
+      if (result.ok && !result.replayed) {
+        io.to(channel(room)).emit("music_queue_changed",{revision:result.appliedRevision});
+      }
+      return {...result,snapshot:await storage.music.snapshot(room)};
+    },true);
+  }
   handle("send_message", async ({ message, reply, attachmentId, clientId }) => {
     if (clientId !== undefined && !uuid(clientId)) return {ok:false,error:"Invalid message ID."};
     const receipt=await storage.receipt(peer.room,clientId);

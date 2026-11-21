@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import {applyQueueEdit, parseQueueCommand, queueError, queueId, resetCurrent} from "./music-queue.js";
 
 const maxTrackSize = 10 * 1024 * 1024;
 const envelopeBytes = 28; // 12-byte IV and 16-byte GCM tag
@@ -37,6 +38,13 @@ export const musicMigration = [
     CHECK (current_entry IS NOT NULL OR (position_ms = 0 AND NOT playing)),
     FOREIGN KEY (room, current_entry) REFERENCES chatcode_music_queue(room, entry_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS chatcode_music_queue_commands (
+    room text NOT NULL REFERENCES chatcode_music_playback(room),
+    command_id uuid NOT NULL,
+    fingerprint bytea NOT NULL CHECK (octet_length(fingerprint)=32),
+    applied_revision bigint NOT NULL CHECK (applied_revision>0),
+    PRIMARY KEY (room,command_id)
+  )`,
   "ALTER TABLE chatcode_object_cleanup ADD COLUMN IF NOT EXISTS music_upload_id uuid",
   `CREATE UNIQUE INDEX IF NOT EXISTS chatcode_music_upload_id ON chatcode_object_cleanup(music_upload_id)
    WHERE music_upload_id IS NOT NULL`
@@ -47,10 +55,14 @@ const emptyState = {revision:"0", current_entry:null, position_ms:0, playing:fal
 
 // Room codes come from the authorized peer. Reservation handles never leave the server.
 export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget}) {
+  async function lockedRevision(tx, room) {
+    const {rows} = await tx.query("SELECT revision::text FROM chatcode_music_playback WHERE room=$1 FOR UPDATE", [room]);
+    return rows[0]?.revision;
+  }
+
   async function lockRoom(tx, room) {
     await tx.query("INSERT INTO chatcode_music_playback(room) VALUES ($1) ON CONFLICT DO NOTHING", [room]);
-    const {rows} = await tx.query("SELECT revision::text FROM chatcode_music_playback WHERE room=$1 FOR UPDATE", [room]);
-    return rows[0].revision;
+    return lockedRevision(tx,room);
   }
 
   async function advanceRevision(tx, room) {
@@ -69,21 +81,23 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
     });
   }
 
-  async function resetCurrent(tx, room, entryIds) {
-    await tx.query(`UPDATE chatcode_music_playback SET current_entry=NULL, playing=false, position_ms=0, anchor_time=NULL
-      WHERE room=$1 AND current_entry=ANY($2::uuid[])`, [room, entryIds]);
-  }
-
   return {
-    async snapshot(code) {
+    async snapshot(code, afterTrackId=null) {
       const room = roomId(code);
+      if (afterTrackId!==null) afterTrackId=queueId(afterTrackId);
       return db.transaction(async tx => {
-        const state = await tx.query(`SELECT ${stateFields} FROM chatcode_music_playback WHERE room=$1 FOR SHARE`, [room]);
-        if (!state.rows.length) return {...emptyState, tracks:[], queue:[]};
+        // One consistent view across these SELECTs, without blocking an editor.
+        await tx.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+        const state = await tx.query(`SELECT ${stateFields} FROM chatcode_music_playback WHERE room=$1`, [room]);
+        if (!state.rows.length) return {...emptyState, tracks:[], queue:[], nextTrackCursor:null};
         const tracks = await tx.query(`SELECT track_id, filename, mime_type, size_bytes, duration_ms, created_at
-          FROM chatcode_music_tracks WHERE room=$1 ORDER BY created_at, track_id`, [room]);
-        const queue = await tx.query("SELECT entry_id, track_id FROM chatcode_music_queue WHERE room=$1 ORDER BY position", [room]);
-        return {...state.rows[0], tracks:tracks.rows, queue:queue.rows};
+          FROM chatcode_music_tracks WHERE room=$1 AND ($2::uuid IS NULL OR track_id>$2)
+          ORDER BY track_id LIMIT 101`, [room,afterTrackId]);
+        const queue = await tx.query(`SELECT q.entry_id, q.track_id, t.filename, t.duration_ms
+          FROM chatcode_music_queue q JOIN chatcode_music_tracks t USING (room,track_id)
+          WHERE q.room=$1 ORDER BY q.position`, [room]);
+        const page=tracks.rows.slice(0,100);
+        return {...state.rows[0], tracks:page, queue:queue.rows, nextTrackCursor:tracks.rows.length>100?page.at(-1).track_id:null};
       });
     },
 
@@ -158,29 +172,30 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
       return bytes;
     },
 
-    enqueue(code, revision, trackId) {
-      const entryId = randomUUID();
-      return edit(code, revision, (tx, room) => tx.query(`INSERT INTO chatcode_music_queue(room,entry_id,track_id,position)
-        SELECT $1,$2,$3,coalesce(max(position),0)+1 FROM chatcode_music_queue WHERE room=$1`, [room, entryId, trackId]));
-    },
-
-    reorder(code, revision, entryIds) {
-      return edit(code, revision, async (tx, room) => {
-        const entries = await tx.query("SELECT entry_id FROM chatcode_music_queue WHERE room=$1", [room]);
-        const remaining = new Set(entries.rows.map(row => row.entry_id));
-        if (!Array.isArray(entryIds) || entryIds.length !== remaining.size || !entryIds.every(id => remaining.delete(id)))
-          throw new Error("Invalid queue order.");
-        await tx.query(`UPDATE chatcode_music_queue q SET position=o.position
-          FROM unnest($2::uuid[]) WITH ORDINALITY AS o(id,position)
-          WHERE q.room=$1 AND q.entry_id=o.id`, [room, entryIds]);
-      });
-    },
-
-    removeEntry(code, revision, entryId) {
-      return edit(code, revision, async (tx, room) => {
-        await resetCurrent(tx, room, [entryId]);
-        const result = await tx.query("DELETE FROM chatcode_music_queue WHERE room=$1 AND entry_id=$2 RETURNING entry_id", [room, entryId]);
-        if (!result.rows.length) throw new Error("Queue entry unavailable.");
+    async queueCommand(code, input, stillJoined=()=>true) {
+      const command=parseQueueCommand(input), room=roomId(code);
+      return db.transaction(async tx=>{
+        // Track publication creates the playback row. A rejected command in an empty room needs no writes.
+        const revision=await lockedRevision(tx,room);
+        if (!stillJoined()) throw queueError("Join this room first.");
+        if (revision===undefined) {
+          if (command.expectedRevision!=="0") return {ok:false,code:"stale_revision"};
+          throw queueError("Room music unavailable.");
+        }
+        const receipt=await tx.query(`SELECT fingerprint, applied_revision::text FROM chatcode_music_queue_commands
+          WHERE room=$1 AND command_id=$2`,[room,command.commandId]);
+        if (receipt.rows.length) {
+          const {fingerprint,applied_revision}=receipt.rows[0];
+          if (!command.fingerprint.equals(fingerprint)) return {ok:false,code:"command_id_reused"};
+          return {ok:true,replayed:true,appliedRevision:applied_revision};
+        }
+        if (revision!==command.expectedRevision) return {ok:false,code:"stale_revision"};
+        await applyQueueEdit(tx,room,command);
+        const appliedRevision=await advanceRevision(tx,room);
+        await tx.query(`INSERT INTO chatcode_music_queue_commands(room,command_id,fingerprint,applied_revision)
+          VALUES ($1,$2,$3,$4)`,[room,command.commandId,command.fingerprint,appliedRevision]);
+        if (!stillJoined()) throw queueError("Join this room first.");
+        return {ok:true,replayed:false,appliedRevision};
       });
     },
 
