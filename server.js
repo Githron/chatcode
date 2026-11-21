@@ -10,8 +10,12 @@ import { MediaConfigurationError } from "./media-storage.js";
 
 const musicUploads=process.env.CHATCODE_MUSIC_UPLOADS==="1";
 const musicQueue=process.env.CHATCODE_MUSIC_QUEUE==="1";
+const musicPlayback=process.env.CHATCODE_MUSIC_PLAYBACK==="1";
 let storage;
-try {storage=await openStorage({enableMusicStorage:musicUploads || musicQueue});}
+try {
+  storage=await openStorage({enableMusicStorage:musicUploads || musicQueue || musicPlayback});
+  if (musicPlayback) await storage.music.pauseEmptyRooms();
+}
 catch (err) {console.error(err instanceof MediaConfigurationError ? err.message : "History storage could not start. Check the database configuration and permissions.");process.exit(1);}
 const app = express();
 app.disable("x-powered-by");
@@ -20,14 +24,16 @@ const io = new Server(server, { maxHttpBufferSize: 24 * 1024 });
 const rooms = new Map();
 const sessions = new Map();
 const channel = code => "chatcode:" + code;
-attachmentRoutes(app, sessions, storage, musicUploads ? storage.music : null);
+attachmentRoutes(app, sessions, storage, musicUploads || musicPlayback ? storage.music : null, musicUploads, room=>{
+  if (musicPlayback) refreshPlayback(room);
+});
 app.use((req, res, next) => {
   res.set({ "X-Content-Type-Options":"nosniff", "Referrer-Policy":"no-referrer",
     "Content-Security-Policy":"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" });
   next();
 });
-// The chat keeps its original CSP. Only this script-free document can play local Blobs.
-app.get("/video-player.html", (_req,res,next)=>{
+// Only the script-free media frames can play local Blobs.
+app.get(["/video-player.html","/audio-player.html"], (_req,res,next)=>{
   res.set("Content-Security-Policy","default-src 'none'; media-src blob:; style-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; sandbox allow-same-origin");
   next();
 });
@@ -44,6 +50,51 @@ function inOrder(room, action) {
   roomTasks.set(room,tail);
   tail.then(()=>{if(roomTasks.get(room)===tail)roomTasks.delete(room);});
   return current;
+}
+
+// Timers are hints. The deadline and revision are checked again under the room lock.
+async function refreshPlayback(room) {
+  const live=rooms.get(room);
+  if (!live) return;
+  try {
+    const snapshot=await storage.music.playbackSnapshot(room);
+    if (rooms.get(room)!==live || BigInt(snapshot.revision)<BigInt(live.playbackRevision ?? 0)) return;
+    if (live.playbackRevision!==snapshot.revision) {
+      io.to(channel(room)).emit("music_playback_snapshot",snapshot);
+      live.playbackRevision=snapshot.revision;
+    }
+    clearTimeout(live.playbackTimer);
+    if (!snapshot.playing) return;
+    const end=new Date(snapshot.anchor_time).getTime()+snapshot.duration_ms-snapshot.position_ms;
+    live.playbackTimer=setTimeout(async ()=>{
+      try {
+        const changed=await storage.music.advanceIfEnded(room,snapshot.revision,()=>rooms.get(room)===live);
+        if (changed && musicQueue) io.to(channel(room)).emit("music_queue_changed",{revision:String(BigInt(snapshot.revision)+1n)});
+      } catch {
+        if (rooms.get(room)===live) live.playbackTimer=setTimeout(()=>refreshPlayback(room),1000);
+        return;
+      }
+      if (rooms.get(room)===live) refreshPlayback(room);
+    },Math.min(2147483647,Math.max(1,end-Date.now())));
+  } catch {
+    if (rooms.get(room)===live) {
+      clearTimeout(live.playbackTimer);
+      live.playbackTimer=setTimeout(()=>refreshPlayback(room),1000);
+    }
+  }
+}
+
+const emptySince=new Map();
+async function freezeEmptyRoom(room) {
+  const at=emptySince.get(room);
+  if (at===undefined) return;
+  await storage.music.pauseEmptyRooms(room,at);
+  emptySince.delete(room);
+}
+function scheduleFreeze(room) {
+  inOrder(room,()=>freezeEmptyRoom(room)).catch(()=>{
+    setTimeout(()=>{if (emptySince.has(room)) scheduleFreeze(room);},1000);
+  });
 }
 
 function members(peer) {
@@ -85,10 +136,11 @@ io.on("connection", socket => {
     if (typeof room !== "string" || !/^[a-zA-Z0-9_-]{3,24}$/.test(room)) return {ok:false,error:"Use a 3–24 character room code with letters, numbers, dashes, or underscores."};
     if (peer && (peer.room!==room || peer.username!==username))return {ok:false,error:"Leave the current room first."};
     const history=await storage.history(room);
+    if (musicPlayback) await freezeEmptyRoom(room);
     if(!socket.connected)return {ok:false,error:"Disconnected."};
     // Another join on this socket may have completed during the database read.
     if(peer && (peer.room!==room || peer.username!==username))return {ok:false,error:"Leave the current room first."};
-    if (peer)return {ok:true,token:peer.token,authorId:peer.authorId,history};
+    if (peer)return {ok:true,token:peer.token,authorId:peer.authorId,history,musicPlayback};
     const authorId=createHash("sha256").update(room+"|"+(uuid(identity)?identity:randomUUID())).digest("hex");
     const state = rooms.get(room) || { members:new Map(), generation:0 };
     rooms.set(room,state);
@@ -98,7 +150,7 @@ io.on("connection", socket => {
     socket.join(channel(room));
     members(peer);
     socket.to(channel(room)).emit("user_joined",{message:username+" joined the room"});
-    return {ok:true,token:peer.token,authorId,history};
+    return {ok:true,token:peer.token,authorId,history,musicPlayback};
   });
   if (musicQueue) {
     handle("music_queue_get",async ({afterTrackId})=>({
@@ -109,8 +161,22 @@ io.on("connection", socket => {
       const result=await storage.music.queueCommand(room,data,()=>socket.connected && sessions.get(peer.token)===peer);
       if (result.ok && !result.replayed) {
         io.to(channel(room)).emit("music_queue_changed",{revision:result.appliedRevision});
+        if (musicPlayback) await refreshPlayback(room);
       }
       return {...result,snapshot:await storage.music.snapshot(room)};
+    },true);
+  }
+  if (musicPlayback) {
+    handle("music_clock",()=>({ok:true,serverTimeMs:Date.now()}),true);
+    handle("music_playback_get",async ()=>({ok:true,snapshot:await storage.music.playbackSnapshot(peer.room)}),true);
+    handle("music_playback_command",async data=>{
+      const room=peer.room;
+      const result=await storage.music.playbackCommand(room,data,()=>socket.connected && sessions.get(peer.token)===peer);
+      if (result.ok && !result.replayed) {
+        if (musicQueue) io.to(channel(room)).emit("music_queue_changed",{revision:result.appliedRevision});
+        await refreshPlayback(room);
+      }
+      return {...result,snapshot:await storage.music.playbackSnapshot(room)};
     },true);
   }
   handle("send_message", async ({ message, reply, attachmentId, clientId }) => {
@@ -156,6 +222,11 @@ io.on("connection", socket => {
     } else {
       clearFiles(peer.room);
       rooms.delete(peer.room);
+      if (musicPlayback) {
+        clearTimeout(peer.state.playbackTimer);
+        emptySince.set(peer.room,Date.now());
+        scheduleFreeze(peer.room);
+      }
     }
   });
 });

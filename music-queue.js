@@ -11,14 +11,17 @@ export function queueId(value) {
   return value.toLowerCase();
 }
 
-export function parseQueueCommand(input) {
+export function parseQueueCommand(input, playback=false) {
   if (!input || typeof input!=="object") throw queueError("Invalid queue command.");
   const {action,expectedRevision}=input;
   const commandId=queueId(input.commandId);
   if (typeof expectedRevision!=="string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedRevision) ||
       BigInt(expectedRevision)>9223372036854775807n) throw queueError("Invalid expected revision.");
   let field, argument;
-  switch (action) {
+  if (playback) {
+    if (!["play","pause","next","previous","seek"].includes(action)) throw queueError("Unknown playback action.");
+    if (action==="seek") field="positionMs";
+  } else switch (action) {
     case "add": field="trackId"; break;
     case "select":
     case "remove": field="entryId"; break;
@@ -31,7 +34,10 @@ export function parseQueueCommand(input) {
     if (!Array.isArray(input.entryIds) || input.entryIds.length>maxEntries) throw queueError("Invalid queue order.");
     argument=Array.from(input.entryIds,queueId);
     if (new Set(argument).size!==argument.length) throw queueError("Invalid queue order.");
-  } else argument=queueId(input[field]);
+  } else if (field==="positionMs") {
+    argument=input.positionMs;
+    if (!Number.isSafeInteger(argument) || argument<0) throw queueError("Invalid playback position.");
+  } else if (field) argument=queueId(input[field]);
   const fingerprint=createHash("sha256").update(JSON.stringify([expectedRevision,action,argument])).digest();
   return {commandId,expectedRevision,action,argument,fingerprint};
 }

@@ -86,7 +86,7 @@ MP3s may contain up to 10 MiB of original bytes. The server authenticates the AE
 
 Retry the same filename and original bytes after reconnecting, including after a 503. Each room deduplicates by a keyed digest of those inputs, including when the browser encrypts again with a fresh IV. The server resumes the same reservation and uses a create-only R2 PUT. A committed object therefore keeps its original ciphertext. Uploads share chat's rate and concurrency limits. Music downloads permit one in flight per session and four per service instance.
 
-Tracks belong to the room independently of chat messages. Queue entries have stable IDs and can refer to the same track more than once. One playback row per room owns the current entry, position in milliseconds, playing flag, database-time anchor and revision. Edits use the revision string from a snapshot. A stale edit must obtain a fresh snapshot before retrying. Removing the selected entry or its track clears the selection and pauses playback. Reopening storage restores the recorded state.
+Tracks belong to the room independently of chat messages. Queue entries have stable IDs and can refer to the same track more than once. One playback row per room owns the current entry, position in milliseconds, playing flag, timestamp anchor and revision. Edits use the revision string from a snapshot. A stale edit must obtain a fresh snapshot before retrying. Removing the selected entry or its track clears the selection and pauses playback. Reopening storage restores the recorded state.
 
 The service reserves capacity before the private R2 PUT and publishes metadata after confirming the object exists. The object key stays server-side. Abandoned reservations expire after one hour. Publication transfers their charge to the track atomically. Deletion transfers the charge to the cleanup queue until R2 confirms removal. Tracks use the existing 40 MiB room and configurable service budgets, including 28 encryption bytes per track. Sum the attachment, music and pending-byte results in `storage-usage.sql`.
 
@@ -108,6 +108,25 @@ The music migrations add track, queue-entry, playback and command-receipt tables
 | `select` | `entryId` | Select the entry at position zero, paused. |
 
 Success returns `{ok, replayed, appliedRevision, snapshot}`. If the acknowledgement is lost, resend the **identical command**, including its original revision, after rejoining. A durable receipt recovers the originally applied revision along with a fresh snapshot. A stale edit returns `ok: false`, `code: "stale_revision"` and the current snapshot. Reconcile the intended change before sending a new command ID. Changing the contents of an already applied command ID returns `command_id_reused`. Only successful edits consume IDs. Receipts are room-scoped and retained independently of chat history, so their database usage grows with accepted edits.
+
+### Synchronized room playback
+
+Set `CHATCODE_MUSIC_PLAYBACK=1` on a single server instance to enable playback. It defaults to off. Playback enables authorized GETs for existing MP3s. Uploading and editing the queue retain their independent flags. All joined members can control the shared transport. Listening is a local choice in room details. Muting a device leaves the room playing for other listeners.
+
+| Socket.IO event | Contract |
+|---|---|
+| `music_clock` | Send `{room}` to sample the server's Unix time in milliseconds (`serverTimeMs`). |
+| `music_playback_get` | Send `{room}` after joining or reconnecting. The acknowledgement contains `ok` and a snapshot with `revision`, `current_entry`, `track_id`, `duration_ms`, `position_ms`, `playing` and `anchor_time`. |
+| `music_playback_command` | Send `room`, `commandId`, `expectedRevision` and `action`. Only `seek` takes an additional field, integer `positionMs` between zero and the track duration inclusive. Acknowledgements, conflicts and retries use the queue receipt contract above. |
+| `music_playback_snapshot` | Room-scoped broadcast of the committed snapshot. Ignore older revisions, including late acknowledgements. |
+
+`play` starts the selected entry, selects the first entry in an unselected queue, or restarts a finished entry. `pause` saves the elapsed position. `seek` preserves play/pause state. `next` and `previous` follow queue order and preserve play/pause state when moving between entries. Previous on the first entry rewinds it. Advancing past the last entry pauses at its end. Only the server advances at a track boundary. An obsolete timer cannot advance a newer revision.
+
+The last member's departure freezes the room at its departure position. On startup, all sessions have ended, so recovery pauses any persisted playing entry at its elapsed position, capped at the track duration. A crash cannot establish the exact instant a device last produced sound. Membership and timers are process-local, as in the existing chat.
+
+An opted-in browser fetches the encrypted track with its live session token and decrypts it to a temporary Blob in a script-free, Blob-only audio frame. The client estimates server time using the lowest round trip of three samples, checks local media time every 250 ms, and seeks when the difference exceeds 120 ms. Changing tracks, muting or disconnecting releases the local audio. A reconnect obtains a fresh token, snapshot and clock sample. Browsers that require another gesture show **Start room audio**.
+
+For the optional two-browser test, point `CHATCODE_TEST_WEBDRIVER` at a local ChromeDriver, optionally set `CHATCODE_TEST_CHROMIUM` to the Chromium executable, and run `npm test`. As with the other integration tests, use only a disposable database for `CHATCODE_TEST_DATABASE_URL`. The browser check measures foreground media clocks after an induced seek error. The 500 ms release target also needs two physical foreground devices and their audio outputs checked on the intended network.
 
 ### Manually releasing and checking video
 

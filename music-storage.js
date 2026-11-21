@@ -53,6 +53,50 @@ export const musicMigration = [
 const stateFields = "revision::text, current_entry, position_ms, playing, anchor_time";
 const emptyState = {revision:"0", current_entry:null, position_ms:0, playing:false, anchor_time:null};
 
+async function playbackState(db, room) {
+  const {rows}=await db.query(`SELECT p.revision::text,p.current_entry,p.position_ms,p.playing,p.anchor_time,
+    q.track_id,t.duration_ms FROM chatcode_music_playback p
+    LEFT JOIN chatcode_music_queue q ON q.room=p.room AND q.entry_id=p.current_entry
+    LEFT JOIN chatcode_music_tracks t ON t.room=q.room AND t.track_id=q.track_id WHERE p.room=$1`,[room]);
+  return rows[0] || {...emptyState,track_id:null,duration_ms:null};
+}
+
+function positionAt(state, now) {
+  const elapsed=state.playing ? Math.max(0,now-new Date(state.anchor_time).getTime()) : 0;
+  return Math.min(state.duration_ms,state.position_ms+elapsed);
+}
+
+// The caller holds the playback row lock. Queue order and duration cannot change underneath us.
+async function applyPlayback(tx, room, {action,argument}, state) {
+  state ||= await playbackState(tx,room);
+  const now=Date.now();
+  let entry=state.current_entry, playing=state.playing, position=positionAt(state,now);
+  if (action==="seek") {
+    if (!entry || argument>state.duration_ms) throw queueError("Invalid playback position.");
+    position=argument;
+  } else if (action==="pause") {
+    playing=false;
+  } else if (action==="play" && entry) {
+    if (position===state.duration_ms) position=0;
+    playing=true;
+  } else {
+    const {rows}=await tx.query("SELECT entry_id FROM chatcode_music_queue WHERE room=$1 ORDER BY position",[room]);
+    if (!rows.length) throw queueError("The room queue is empty.");
+    const index=rows.findIndex(row=>row.entry_id===entry);
+    const target=action==="previous" ? Math.max(0,index-1) : index+1;
+    if (target===rows.length) {
+      position=state.duration_ms;
+      playing=false;
+    } else {
+      entry=rows[target].entry_id;
+      position=0;
+      if (action==="play") playing=true;
+    }
+  }
+  await tx.query(`UPDATE chatcode_music_playback SET current_entry=$2, position_ms=$3,
+    playing=$4, anchor_time=$5 WHERE room=$1`,[room,entry,position,playing,playing?new Date(now):null]);
+}
+
 // Room codes come from the authorized peer. Reservation handles never leave the server.
 export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget}) {
   async function lockedRevision(tx, room) {
@@ -78,6 +122,34 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
       if (revision !== expectedRevision) throw new Error("Music revision changed.");
       await action(tx, room);
       return advanceRevision(tx, room);
+    });
+  }
+
+  async function commitCommand(code, input, stillJoined, playback) {
+    const command=parseQueueCommand(input,playback), room=roomId(code);
+    return db.transaction(async tx=>{
+      // Track publication creates the playback row. A rejected command in an empty room needs no writes.
+      const revision=await lockedRevision(tx,room);
+      if (!stillJoined()) throw queueError("Join this room first.");
+      if (revision===undefined) {
+        if (command.expectedRevision!=="0") return {ok:false,code:"stale_revision"};
+        throw queueError("Room music unavailable.");
+      }
+      const receipt=await tx.query(`SELECT fingerprint, applied_revision::text FROM chatcode_music_queue_commands
+        WHERE room=$1 AND command_id=$2`,[room,command.commandId]);
+      if (receipt.rows.length) {
+        const {fingerprint,applied_revision}=receipt.rows[0];
+        if (!command.fingerprint.equals(fingerprint)) return {ok:false,code:"command_id_reused"};
+        return {ok:true,replayed:true,appliedRevision:applied_revision};
+      }
+      if (revision!==command.expectedRevision) return {ok:false,code:"stale_revision"};
+      if (playback) await applyPlayback(tx,room,command);
+      else await applyQueueEdit(tx,room,command);
+      const appliedRevision=await advanceRevision(tx,room);
+      await tx.query(`INSERT INTO chatcode_music_queue_commands(room,command_id,fingerprint,applied_revision)
+        VALUES ($1,$2,$3,$4)`,[room,command.commandId,command.fingerprint,appliedRevision]);
+      if (!stillJoined()) throw queueError("Join this room first.");
+      return {ok:true,replayed:false,appliedRevision};
     });
   }
 
@@ -172,30 +244,40 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
       return bytes;
     },
 
-    async queueCommand(code, input, stillJoined=()=>true) {
-      const command=parseQueueCommand(input), room=roomId(code);
+    queueCommand(code, input, stillJoined=()=>true) {
+      return commitCommand(code,input,stillJoined,false);
+    },
+    playbackCommand(code, input, stillJoined=()=>true) {
+      return commitCommand(code,input,stillJoined,true);
+    },
+
+    playbackSnapshot(code) { return playbackState(db,roomId(code)); },
+
+    advanceIfEnded(code, expectedRevision, occupied) {
+      const room=roomId(code);
       return db.transaction(async tx=>{
-        // Track publication creates the playback row. A rejected command in an empty room needs no writes.
-        const revision=await lockedRevision(tx,room);
-        if (!stillJoined()) throw queueError("Join this room first.");
-        if (revision===undefined) {
-          if (command.expectedRevision!=="0") return {ok:false,code:"stale_revision"};
-          throw queueError("Room music unavailable.");
-        }
-        const receipt=await tx.query(`SELECT fingerprint, applied_revision::text FROM chatcode_music_queue_commands
-          WHERE room=$1 AND command_id=$2`,[room,command.commandId]);
-        if (receipt.rows.length) {
-          const {fingerprint,applied_revision}=receipt.rows[0];
-          if (!command.fingerprint.equals(fingerprint)) return {ok:false,code:"command_id_reused"};
-          return {ok:true,replayed:true,appliedRevision:applied_revision};
-        }
-        if (revision!==command.expectedRevision) return {ok:false,code:"stale_revision"};
-        await applyQueueEdit(tx,room,command);
-        const appliedRevision=await advanceRevision(tx,room);
-        await tx.query(`INSERT INTO chatcode_music_queue_commands(room,command_id,fingerprint,applied_revision)
-          VALUES ($1,$2,$3,$4)`,[room,command.commandId,command.fingerprint,appliedRevision]);
-        if (!stillJoined()) throw queueError("Join this room first.");
-        return {ok:true,replayed:false,appliedRevision};
+        if (await lockedRevision(tx,room)!==expectedRevision || !occupied()) return false;
+        const state=await playbackState(tx,room);
+        if (!state.playing || positionAt(state,Date.now())<state.duration_ms) return false;
+        await applyPlayback(tx,room,{action:"next"},state);
+        await advanceRevision(tx,room);
+        return true;
+      });
+    },
+
+    // At startup every room is empty. On disconnect freeze only the departing room.
+    pauseEmptyRooms(code, at=Date.now()) {
+      const params=[new Date(at)];
+      if (code!==undefined) params.push(roomId(code));
+      const sql=`UPDATE chatcode_music_playback p SET revision=revision+1, playing=false, anchor_time=NULL,
+        position_ms=least(t.duration_ms, p.position_ms+greatest(0, floor(extract(epoch FROM ($1::timestamptz-p.anchor_time))*1000)))
+        FROM chatcode_music_queue q JOIN chatcode_music_tracks t USING (room,track_id)
+        WHERE p.playing AND p.room=q.room AND p.current_entry=q.entry_id ${code===undefined?"":"AND p.room=$2"}`;
+      if (code===undefined) return db.query(sql,params);
+      return db.transaction(async tx=>{
+        // Also wait for a play that passed its session check and is still committing.
+        await lockedRevision(tx,params[1]);
+        await tx.query(sql,params);
       });
     },
 

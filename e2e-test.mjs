@@ -45,11 +45,14 @@ const jpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBA
 const webp = Buffer.from("UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAEAAgA0JaACdLoB+AADsAD+8MQL/yC5YXXI1/8gP+QH/ID/+PIAAAA=","base64");
 const docx = Buffer.from("UEsDBBQAAAAIAJO4dF2sbhJangAAANwAAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbF2PsQ7CMBBDf6XKitqrGBhQ24UdGPiBU3JtI5pLlBwF/p4EpA6Mlu1nubu9A6Xq5RZOvZpFwhEg6ZkcpsYH4uyMPjqULOMEAfUdJ4J92x5AexZiqaUw1NBdVorRGqquGOWMjnoFTx8NGK8fLiebTFPV6Vcry73CEBarUaxnWNn8bdZ+HK2mrV9oIXpNKVme3NJsjkPLu4KHoYPvqeEDUEsDBBQAAAAIAJO4dF1hey9DiQAAAPIAAAALAAAAX3JlbHMvLnJlbHONzzsOAiEQBuCrEA6ws1pYGKCy2dZ4AQLDIy6PDBj19lJYrMbCcuaffH9GnHHVPZbcQqyNPdKam+Sh93oEaCZg0m0qFfNIXKGk+xjJQ9Xmqj3Cfp4PQFuDK7E12WIlp8XuOLs8K/5jF+eiwVMxt4S5/6j4uhiyJo9d8nshC/a9ngbLQQn4eFG9AFBLAwQUAAAACACTuHRdyUDSwnYAAACcAAAAEQAAAHdvcmQvZG9jdW1lbnQueG1sRc7BDcIwDAXQVaoOgCsOHKKQIdggJKGtVNuRbZSyPU05cHlfX5al75vLnN5YyIYdN1LX7uNiVh2ApqVg1AvXQsftxYLRjiozNJZchVNRXWnGDa7TdAOMK43BN/fk/OlZO9Kx8GDGgdiKeui9K6f19PcD/z3hC1BLAQIUAxQAAAAIAJO4dF2sbhJangAAANwAAAATAAAAAAAAAAAAAACAAQAAAABbQ29udGVudF9UeXBlc10ueG1sUEsBAhQDFAAAAAgAk7h0XWF7L0OJAAAA8gAAAAsAAAAAAAAAAAAAAIABzwAAAF9yZWxzLy5yZWxzUEsBAhQDFAAAAAgAk7h0XclA0sJ2AAAAnAAAABEAAAAAAAAAAAAAAIABgQEAAHdvcmQvZG9jdW1lbnQueG1sUEsFBgAAAAADAAMAuQAAACYCAAAAAA==","base64");
 
-function next(socket,event) {
+function next(socket,event,accept=()=>true) {
   return new Promise((resolve,reject)=>{
-    const onData = data => { clearTimeout(timer); resolve(data); };
+    const onData = data => {
+      if (!accept(data)) return;
+      socket.off(event,onData); clearTimeout(timer); resolve(data);
+    };
     const timer=setTimeout(()=>{ socket.off(event,onData); reject(new Error("Timed out waiting for "+event)); },3500);
-    socket.once(event,onData);
+    socket.on(event,onData);
   });
 }
 function request(socket,event,data) {
@@ -109,14 +112,14 @@ test("storage failures report only the failing step and safe diagnostic fields",
   ]);
 });
 
-test("two-client room and private attachment transfers", {timeout:210000}, async t=>{
+test("two-client room and private attachment transfers", {timeout:process.env.CHATCODE_TEST_WEBDRIVER ? 360000 : 210000}, async t=>{
   const directory=await mkdtemp(pathJoin(tmpdir(),"chatcode-db-"));
   const objects=pathJoin(directory,"objects");
   await mkdir(objects);
   const account="a".repeat(32);
-  let backend="database",budget=128*1024*1024,pgOptions="",musicEnabled=false,queueEnabled=false;
+  let backend="database",budget=128*1024*1024,pgOptions="",musicEnabled=false,queueEnabled=false,playbackEnabled=false;
   let stderr="";
-  const start=()=>{
+  const start=(port=0)=>{
     const child=spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
     cwd:new URL("./",import.meta.url),env:{...process.env,DATABASE_URL:process.env.CHATCODE_TEST_DATABASE_URL||"",
       PGHOST:"",PGOPTIONS:pgOptions,RENDER:"",NODE_ENV:"test",CHATCODE_MEDIA_BACKEND:"database",CHATCODE_STORAGE_BUDGET_BYTES:String(budget),
@@ -124,8 +127,8 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
       AWS_ACCESS_KEY_ID:"legacy-test",AWS_SECRET_ACCESS_KEY:"fixture",AWS_SESSION_TOKEN:"",
       R2_ACCOUNT_ID:backend==="r2"?account:"",R2_ENDPOINT:backend==="r2"?"https://"+account+".r2.cloudflarestorage.com":"",
       R2_BUCKET_NAME:backend==="r2"?"test-r2":"",R2_ACCESS_KEY_ID:backend==="r2"?"r2-test":"",R2_SECRET_ACCESS_KEY:backend==="r2"?"fixture":"",
-      CHATCODE_MUSIC_UPLOADS:musicEnabled?"1":"",CHATCODE_MUSIC_QUEUE:queueEnabled?"1":"",
-      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","pipe"]});
+      CHATCODE_MUSIC_UPLOADS:musicEnabled?"1":"",CHATCODE_MUSIC_QUEUE:queueEnabled?"1":"",CHATCODE_MUSIC_PLAYBACK:playbackEnabled?"1":"",
+      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:String(port)},stdio:["ignore","pipe","pipe"]});
     child.stderr.on("data",chunk=>{stderr+=chunk;process.stderr.write(chunk);});
     return child;
   };
@@ -143,7 +146,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
   return "http://127.0.0.1:"+port;
   }
   let url=await address();
-  await t.test("only the script-free video frame can load Blob media",async()=>{
+  await t.test("only the script-free media frames can load Blob media",async()=>{
     const chat=await fetch(url),frame=await fetch(url+"/video-player.html");
     assert.equal(frame.status,200);
     assert.match(chat.headers.get("content-security-policy"),/frame-ancestors 'none'/);
@@ -151,13 +154,18 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     const policy=frame.headers.get("content-security-policy");
     for(const directive of ["default-src 'none'","media-src blob:","frame-ancestors 'self'","sandbox allow-same-origin"])
       assert.ok(policy.split("; ").includes(directive));
+    const audioFrame=await fetch(url+"/audio-player.html");
+    assert.equal(audioFrame.headers.get("content-security-policy"),policy);
+    const audioMarkup=await audioFrame.text();
+    assert.match(audioMarkup,/<audio /);
+    assert.doesNotMatch(audioMarkup,/<script|<source|\s(?:autoplay|src)=/i);
     const markup=await frame.text();
     assert.match(markup,/<video controls playsinline preload="none"/);
     assert.doesNotMatch(markup,/<script|<source|\s(?:autoplay|src)=/i);
   });
-  async function restart(){
+  async function restart(port=0){
     const ended=once(server,"exit");server.kill();await ended;
-    server=start();url=await address();
+    server=start(port);url=await address();
   }
   const connect=async()=>{
     const client=io(url,{autoConnect:false,reconnection:false});
@@ -553,6 +561,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     const disabled=await connect();
     await join(disabled,"Before",code);
     await assert.rejects(disabled.timeout(200).emitWithAck("music_queue_get",{room:code}),/timed out/);
+    await assert.rejects(disabled.timeout(200).emitWithAck("music_playback_get",{room:code}),/timed out/);
     queueEnabled=true; musicEnabled=true; backend="r2"; budget=128*1024*1024; pgOptions="";
     await restart();
     const a=await connect(), b=await connect(), x=await connect();
@@ -635,4 +644,107 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     await rm(pathJoin(objects,"offline"));
     assert.deepEqual((await readdir(objects)).sort(),objectsBefore);
   });
+  await t.test("authoritative playback, revision races, empty rooms and restart recovery",async pt=>{
+    playbackEnabled=musicEnabled=queueEnabled=true;
+    await restart();
+    const room="play-"+randomUUID().slice(0,8), outside=room+"-x";
+    let a=await connect(), b=await connect();
+    const x=await connect(), foreign=[];
+    x.on("music_playback_snapshot",s=>foreign.push(s));
+    const get=async client=>(await request(client,"music_playback_get",{room})).snapshot;
+    const payload=(revision,action,args)=>({room,commandId:randomUUID(),expectedRevision:revision,action,...args});
+    const send=(client,data)=>request(client,"music_playback_command",data);
+    const command=async (action,args)=>send(a,payload((await get(a)).revision,action,args));
+    const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    assert.equal((await send(a,payload("0","play"))).ok,false);
+    const member=await join(a,"Conductor",room);
+    assert.ok(member.musicPlayback);
+    await join(b,"Member",room);
+    await join(x,"Outsider",outside);
+    assert.equal((await send(x,payload("0","play"))).ok,false);
+    const clock=await request(a,"music_clock",{room});
+    assert.ok(Math.abs(Date.now()-clock.serverTimeMs)<1000);
+    const key=await roomKey(room);
+    // Repeat the fixture's MPEG frames without its ID3v2 header or ID3v1 footer.
+    const bytes=Buffer.concat(Array(120).fill(mono.subarray(64,-128)));
+    const res=await fetch(url+"/api/music/tracks",{method:"POST",headers:{...auth(member.token),
+      "Content-Type":"application/octet-stream","X-File-Name":"long.mp3"},body:await seal(key,bytes)});
+    assert.equal(res.status,201);
+    const {id:trackId,durationMs}=await res.json();
+    let queue;
+    for (let i=0;i<3;i++) {
+      queue=await request(a,"music_queue_command",payload(String(i+1),"add",{trackId}));
+      assert.ok(queue.ok);
+    }
+    const [first,second,third]=queue.snapshot.queue.map(q=>q.entry_id);
+    const play=payload("4","play");
+    const event=next(b,"music_playback_snapshot",s=>s.revision==="5");
+    const replies=await Promise.all([send(a,play),send(b,play)]);
+    assert.deepEqual(replies.map(r=>r.replayed).sort(),[false,true]);
+    assert.equal((await event).current_entry,first);
+    assert.equal((await send(b,{...play,action:"pause"})).code,"command_id_reused");
+    assert.equal((await send(b,payload("4","next"))).code,"stale_revision");
+    for (const args of [{positionMs:-1},{positionMs:durationMs+1},{positionMs:3,playing:true}])
+      assert.equal((await send(b,payload("5","seek",args))).ok,false);
+    await wait(80);
+    const paused=(await command("pause")).snapshot;
+    assert.ok(!paused.playing && paused.position_ms>=70 && paused.anchor_time===null);
+    assert.equal((await command("next")).snapshot.current_entry,second);
+    assert.equal((await command("previous")).snapshot.current_entry,first);
+    const seek=await command("seek",{positionMs:durationMs-350});
+    assert.equal(seek.snapshot.playing,false);
+    assert.equal(seek.snapshot.position_ms,durationMs-350);
+    const changed=next(b,"music_playback_snapshot",s=>s.current_entry===second);
+    await command("play");
+    const advanced=await changed;
+    assert.equal(advanced.current_entry,second);
+    assert.ok(advanced.playing);
+    await wait(250);
+    assert.equal((await get(a)).revision,advanced.revision);
+    await command("seek",{positionMs:durationMs-400});
+    await command("previous");
+    await wait(500);
+    assert.equal((await get(a)).current_entry,first);
+    b.disconnect();
+    assert.equal((await get(a)).playing,true);
+    a.disconnect();
+    await wait(250);
+    a=await connect(); await join(a,"Returning",room);
+    const frozen=await get(a);
+    assert.ok(!frozen.playing && frozen.position_ms>=400 && frozen.position_ms<5000);
+    await wait(100);
+    assert.deepEqual(await get(a),frozen);
+    await command("play");
+    musicEnabled=queueEnabled=false;
+    await restart();
+    a=await connect(); const back=await join(a,"Returning",room);
+    const restored=await get(a);
+    assert.equal(restored.current_entry,first);
+    assert.ok(!restored.playing && restored.position_ms>=frozen.position_ms);
+    assert.ok((await send(a,play)).replayed);
+    const path=url+"/api/music/tracks";
+    assert.equal((await fetch(path,{method:"POST",headers:auth(back.token)})).status,404);
+    const audio=await fetch(path+"/"+trackId,{headers:auth(back.token)});
+    assert.equal(audio.headers.get("cache-control"),"no-store");
+    assert.deepEqual(Buffer.from(await unseal(key,new Uint8Array(await audio.arrayBuffer()))),bytes);
+    assert.equal((await command("next")).snapshot.current_entry,second);
+    assert.equal((await command("next")).snapshot.current_entry,third);
+    await command("seek",{positionMs:durationMs-350});
+    const finished=next(a,"music_playback_snapshot",s=>!s.playing && s.position_ms===durationMs);
+    await command("play");
+    const end=await finished;
+    assert.equal(end.current_entry,third);
+    assert.equal(end.position_ms,durationMs);
+    assert.equal(end.playing,false);
+    assert.deepEqual(foreign,[]);
+    if (process.env.CHATCODE_TEST_WEBDRIVER) {
+      const {playbackBrowser}=await import("./test/playback-browser.mjs");
+      await pt.test("two foreground browsers follow the room after drift, autoplay denial and reconnect",
+        bt=>playbackBrowser(bt,url,room,command,async()=>{
+          await restart(Number(new URL(url).port));
+          a=await connect(); await join(a,"Conductor",room);
+        },{"test.png":png,"clip.mp4":mp4,"clip.webm":webm}));
+    }
+  });
+
 });

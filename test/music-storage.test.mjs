@@ -279,6 +279,33 @@ test("music storage migration and lifecycle", async t => {
     assert.equal((await music.snapshot(code)).revision,"4");
   });
 
+  await t.test("only one track-end or member command can consume a playback revision",async()=>{
+    const music=store.music, code="playback-boundaries", trackId=randomUUID();
+    await music.saveUpload(code,trackId,track,Buffer.alloc(track.sizeBytes+28),()=>true);
+    const edit=(revision,action,fields)=>({expectedRevision:revision,commandId:randomUUID(),action,...fields});
+    for (const revision of ["1","2","3"]) await music.queueCommand(code,edit(revision,"add",{trackId}));
+    const [a,b]= (await music.snapshot(code)).queue;
+    let checks=0;
+    const play=edit("4","play");
+    await assert.rejects(music.playbackCommand(code,play,()=>++checks===1),/Join this room/);
+    assert.equal((await music.playbackSnapshot(code)).revision,"4");
+    await music.playbackCommand(code,play);
+    assert.equal(await music.advanceIfEnded(code,"5",()=>true),false);
+    await music.playbackCommand(code,edit("5","seek",{positionMs:track.durationMs}));
+    assert.equal(await music.advanceIfEnded(code,"6",()=>false),false);
+    const next=edit("6","next");
+    const [timer,duplicate,manual]=await Promise.all([
+      music.advanceIfEnded(code,"6",()=>true),music.advanceIfEnded(code,"6",()=>true),music.playbackCommand(code,next)
+    ]);
+    assert.equal([timer,duplicate,manual.ok].filter(Boolean).length,1);
+    const state=await music.playbackSnapshot(code);
+    assert.equal(state.revision,"7");
+    assert.equal(state.current_entry,b.entry_id);
+    assert.equal(state.playing,true);
+    assert.equal((await music.playbackCommand(code,edit("7","previous"))).appliedRevision,"8");
+    assert.equal((await music.playbackSnapshot(code)).current_entry,a.entry_id);
+  });
+
   await t.test("room-scoped catalog pages and the queue capacity bound preserve complete ordered snapshots",async()=>{
     const code="paged-queue", room=createHash("sha256").update(code).digest("hex");
     await inspect(async db=>{

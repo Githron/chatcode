@@ -1,5 +1,6 @@
 import { uploadLimit, formats, sizeLabel, roomKey, encodeText, decodeText, upload, fetchFile } from "./transfer.js";
 
+import {roomAudio} from "./room-audio.js";
 import {downloadBlob, imagePreview, isPreviewImage, releasePreviews as releaseImages} from "./image-preview.js";
 import {videoPlayer, releaseVideo} from "./video-player.js";
 
@@ -56,6 +57,7 @@ function controls(){
   $("send-btn").disabled=sending||!token||(!file&&!input.value.trim());
   input.readOnly=sending; $("attach").disabled=sending; $("remove-file").disabled=sending; $("reply-cancel").disabled=sending;
 }
+const playback=roomAudio($("listen-btn"),$("resume-audio"),socket,emit,notice);
 async function establish(name,code){
   const version=connectionVersion;
   const returning=Boolean(room);
@@ -70,6 +72,7 @@ async function establish(name,code){
     throw new Error("This server is running an older ChatCode version. Restart the server, then reload this page.");
   }
   username=name;room=code;token=result.token;
+  playback.join(result.musicPlayback ? {room,key,token} : null);
   $("header-room").textContent=$("room-display").textContent=room;
   $("network").textContent="Connected"; $("wake-status").textContent="";
   $("join-screen").hidden=true;$("chat-screen").hidden=false;
@@ -125,6 +128,7 @@ socket.on("connect",async()=>{
   controls();
 });
 socket.on("disconnect",()=>{
+  playback.disconnect();
   releaseVideo();
   connectionVersion++;epoch++;pendingLive=[];syncing=true;token="";stagedId="";uploadController?.abort();stopTyping();resetTypists();
   $("network").textContent="Reconnecting…";$("wake-status").textContent="Reconnecting…";controls();

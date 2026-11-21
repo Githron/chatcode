@@ -119,12 +119,12 @@ export function stagedFile(id, peer) {
 
 export function releaseFile(id) { files.delete(id); }
 
-export function attachmentRoutes(app, sessions, storage, music=storage.music) {
+export function attachmentRoutes(app, sessions, storage, music=storage.music, allowMusicUploads=!!music, trackPublished=()=>{}) {
   let recentUploads = [];
   const musicPath="/api/music/tracks";
-  const uploadPaths=music ? ["/api/files",musicPath] : ["/api/files"];
+  const uploadPaths=allowMusicUploads ? ["/api/files",musicPath] : ["/api/files"];
   if (music) app.use(musicPath,(req,res,next)=>{req.musicUpload=true; next();});
-  app.use(uploadPaths, (req, res, next) => {
+  app.use(music ? ["/api/files",musicPath] : ["/api/files"], (req, res, next) => {
     res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
     const peer = sessions.get((req.get("Authorization") || "").replace(/^Bearer /, ""));
     if (!peer || req.get("Authorization") !== "Bearer " + peer.token) return res.status(401).json({ error: "Join the room again to access files." });
@@ -182,6 +182,7 @@ export function attachmentRoutes(app, sessions, storage, music=storage.music) {
         if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
         try {
           const created=await music.saveUpload(peer.room,id,{filename:name,sizeBytes,durationMs},bytes,stillJoined);
+          if (created) trackPublished(peer.room);
           if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
           return res.status(created?201:200).json({id,name,type:"audio/mpeg",size:sizeBytes,durationMs});
         } catch (err) {
