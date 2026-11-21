@@ -56,6 +56,12 @@ Limit the service identity to reading, writing, and deleting objects under the b
 
 Browsers use AES-GCM with a key derived from the room code. The server receives that code and decrypts uploads briefly to validate their contents. Usernames, timestamps, attachment names and validated file types are metadata. Format checks do not scan for malware. Keep authorization headers, database URLs, room codes and file contents out of logs.
 
+### Diagnosing a failed image send
+
+A successful `POST /api/files` stages the validated image in memory. On `send_message`, the server checks the receipt, reserves capacity in PostgreSQL, puts the encrypted bytes in the bucket, then saves the message and consumes the reservation in one database transaction. The room receives the message after that transaction commits.
+
+Filter Render logs for `storage_failure` at the time of the failed send. The `operation` identifies the failing step. For example, `postgres.insert_reservation` precedes the bucket write, `r2.PutObject` is the bucket write, and `postgres.insert_message` follows it. PostgreSQL errors include SQLSTATE when available (for example, `42501` for insufficient privilege). R2 errors include a recognized error code and HTTP status when available. An unrecognized provider error is recorded as `unknown`. Retries reuse the reservation while the upload is still staged.
+
 ## Files and retention
 
 - New images support JPEG, PNG, WebP and single-frame GIF, up to 8 MB (8,000,000 original bytes) and 32 million pixels. PDF, ZIP, DOCX, XLSX, PPTX, TXT, Markdown and CSV retain the 10 MiB limit. Existing larger images remain downloadable.

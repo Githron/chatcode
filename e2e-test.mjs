@@ -9,6 +9,9 @@ import {join as pathJoin} from "node:path";
 import { io } from "socket.io-client";
 import { roomKey, encodeText, decodeText, seal, unseal, fileLimit } from "./public/transfer.js";
 import { mediaStorage } from "./media-storage.js";
+import { storageStep } from "./storage-diagnostics.js";
+import { S3Client } from "@aws-sdk/client-s3";
+import pg from "pg";
 
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
 const room = "test-"+randomUUID().slice(0,12);
@@ -35,20 +38,53 @@ test("media configuration fails closed and allows an explicit database fallback"
   assert.equal(mediaStorage({CHATCODE_MEDIA_BACKEND:"database"}).newKey(),null);
 });
 
+test("R2 uses the validated values for signing and addressing the bucket",async t=>{
+  t.mock.method(S3Client.prototype,"send",async function(command){
+    const credentials=await this.config.credentials();
+    assert.equal(credentials.accessKeyId,"fixture-id");
+    assert.equal(credentials.secretAccessKey,"fixture-secret");
+    assert.equal(command.input.Bucket,"test-media");
+    assert.match(command.input.Key,/^chatcode\/r2\//);
+    assert.equal((await this.config.endpoint()).hostname,account+".r2.cloudflarestorage.com");
+  });
+  const account="a".repeat(32);
+  const media=mediaStorage({R2_ACCOUNT_ID:account+" ",R2_ENDPOINT:" https://"+account+".r2.cloudflarestorage.com/\n",
+    R2_BUCKET_NAME:" test-media ",R2_ACCESS_KEY_ID:"fixture-id\n",R2_SECRET_ACCESS_KEY:" fixture-secret\r\n"});
+  await media.put(media.newKey(),Buffer.alloc(32));
+});
+
+test("storage failures report only the failing step and safe diagnostic fields",async t=>{
+  const log=t.mock.method(console,"error",()=>{});
+  const sqlError=Object.assign(new Error("private filename"),{code:"42501",detail:"private row contents"});
+  const fail=()=>{throw sqlError;};
+  await assert.rejects(storageStep("postgres.reserve_transaction",()=>storageStep("postgres.insert_reservation",fail)),err=>err===sqlError);
+  const unknown=Object.assign(new Error("private response body"),{name:"private-room",code:"secret-token",$metadata:{httpStatusCode:502}});
+  await assert.rejects(storageStep("r2.PutObject",()=>{throw unknown;}),err=>err===unknown);
+  assert.deepEqual(log.mock.calls.map(call=>call.arguments),[
+    [JSON.stringify({event:"storage_failure",operation:"postgres.insert_reservation",sqlstate:"42501"})],
+    [JSON.stringify({event:"storage_failure",operation:"r2.PutObject",code:"unknown",httpStatus:502})],
+  ]);
+});
+
 test("two-client room and private attachment transfers", {timeout:210000}, async t=>{
   const directory=await mkdtemp(pathJoin(tmpdir(),"chatcode-db-"));
   const objects=pathJoin(directory,"objects");
   await mkdir(objects);
   const account="a".repeat(32);
-  let backend="database",budget=128*1024*1024;
-  const start=()=>spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
+  let backend="database",budget=128*1024*1024,pgOptions="";
+  let stderr="";
+  const start=()=>{
+    const child=spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
     cwd:new URL("./",import.meta.url),env:{...process.env,DATABASE_URL:process.env.CHATCODE_TEST_DATABASE_URL||"",
-      PGHOST:"",RENDER:"",NODE_ENV:"test",CHATCODE_MEDIA_BACKEND:"database",CHATCODE_STORAGE_BUDGET_BYTES:String(budget),
+      PGHOST:"",PGOPTIONS:pgOptions,RENDER:"",NODE_ENV:"test",CHATCODE_MEDIA_BACKEND:"database",CHATCODE_STORAGE_BUDGET_BYTES:String(budget),
       S3_BUCKET:backend==="database"?"":"test-legacy",S3_ENDPOINT:"https://legacy.invalid",AWS_REGION:"us-east-1",
       AWS_ACCESS_KEY_ID:"legacy-test",AWS_SECRET_ACCESS_KEY:"fixture",AWS_SESSION_TOKEN:"",
       R2_ACCOUNT_ID:backend==="r2"?account:"",R2_ENDPOINT:backend==="r2"?"https://"+account+".r2.cloudflarestorage.com":"",
       R2_BUCKET_NAME:backend==="r2"?"test-r2":"",R2_ACCESS_KEY_ID:backend==="r2"?"r2-test":"",R2_SECRET_ACCESS_KEY:backend==="r2"?"fixture":"",
-      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","inherit"]});
+      CHATCODE_TEST_OBJECT_DIR:objects,CHATCODE_DATA_DIR:pathJoin(directory,"db"),PORT:"0"},stdio:["ignore","pipe","pipe"]});
+    child.stderr.on("data",chunk=>{stderr+=chunk;process.stderr.write(chunk);});
+    return child;
+  };
   let server=start();
   const clients=[];
   t.after(async()=>{
@@ -239,6 +275,7 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
     const offline=pathJoin(objects,"offline");
     await writeFile(offline,"");
     assert.equal((await request(uploader,"send_message",message)).ok,false);
+    assert.ok(stderr.includes(JSON.stringify({event:"storage_failure",operation:"r2.PutObject",code:"AccessDenied",httpStatus:403})));
     assert.equal((await download(image.id,r.token)).status,404);
     assert.equal((await join(reader,"Reader",code)).history.some(m=>m.attachment?.id===image.id),false);
     await rm(offline);
@@ -303,5 +340,46 @@ test("two-client room and private attachment transfers", {timeout:210000}, async
       await new Promise(resolve=>setTimeout(resolve,100));
     }
     assert.equal(status,201);
+  });
+  await t.test("PostgreSQL failures before and after R2 PUT are distinguishable and retryable",
+    {skip:!process.env.CHATCODE_TEST_DATABASE_URL},async()=>{
+    pgOptions="-c lock_timeout=500ms";
+    budget=128*1024*1024;
+    await restart();
+    const writer=await connect(), member=await join(writer,"Writer",code);
+    const staged=await postImage(member.token);
+    assert.equal(staged.status,201);
+    const file=await staged.json();
+    const payload={room:code,clientId:randomUUID(),attachmentId:file.id};
+    const locker=new pg.Client({connectionString:process.env.CHATCODE_TEST_DATABASE_URL});
+    await locker.connect();
+    try {
+      for(const [table,step,objectCount] of [
+        ["chatcode_object_cleanup","insert_reservation",0],["chatcode_messages","insert_message",1],
+      ]){
+        await locker.query("BEGIN");
+        await locker.query("LOCK TABLE "+table+" IN SHARE MODE");
+        stderr="";
+        const result=await request(writer,"send_message",payload);
+        await locker.query("ROLLBACK");
+        assert.deepEqual(result,{ok:false,error:"Room storage is unavailable. Please retry."});
+        assert.equal((await download(file.id,member.token)).status,404);
+        assert.equal((await readdir(objects)).length,objectCount);
+        assert.deepEqual(stderr.trim().split("\n").map(line=>JSON.parse(line)),[
+          {event:"storage_failure",operation:"postgres."+step,sqlstate:"55P03"},
+        ]);
+      }
+      assert.ok((await request(writer,"send_message",payload)).ok);
+      assert.equal((await download(file.id,member.token)).status,200);
+      assert.equal((await readdir(objects)).length,1);
+      const saved=await locker.query("SELECT object_key FROM chatcode_messages WHERE attachment_id=$1",[file.id]);
+      assert.ok((await request(writer,"clear_chat",{room:code,confirm:true})).ok);
+      for(let i=0;i<50;i++){
+        const pending=await locker.query("SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1",[saved.rows[0].object_key]);
+        if(!pending.rowCount)return;
+        await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      assert.fail("Test object cleanup did not finish");
+    } finally {await locker.end();}
   });
 });

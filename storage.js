@@ -3,6 +3,11 @@ import { mkdir, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import pg from "pg";
 import { mediaStorage, MediaConfigurationError } from "./media-storage.js";
+import { storageStep } from "./storage-diagnostics.js";
+
+function query(db, operation, sql, params) {
+  return storageStep("postgres." + operation, () => db.query(sql, params));
+}
 
 const MiB = 1024 * 1024;
 function expiredReservation() {
@@ -44,15 +49,17 @@ async function database() {
       exec:text=>pool.query(text),
       transaction:async fn=>{
         const client=await pool.connect();
+        let discard;
         try {
           await client.query("BEGIN");
           const result=await fn(client);
           await client.query("COMMIT");
           return result;
         } catch(error) {
-          await client.query("ROLLBACK");
+          try { await client.query("ROLLBACK"); }
+          catch (rollbackError) { discard=rollbackError; }
           throw error;
-        } finally {client.release();}
+        } finally {client.release(discard);}
       }
     };
   }
@@ -76,7 +83,7 @@ export async function openStorage() {
   const db = await database();
   await db.exec(sql);
   async function checkSpace(tx, room, size) {
-    const {rows} = await tx.query(`SELECT sum(byte_count) AS total,
+    const {rows} = await query(tx,"check_budget",`SELECT sum(byte_count) AS total,
       sum(byte_count) FILTER (WHERE room=$1) AS local FROM (
         SELECT byte_count, room FROM chatcode_messages WHERE byte_count>0
         UNION ALL SELECT byte_count, room FROM chatcode_object_cleanup
@@ -89,12 +96,12 @@ export async function openStorage() {
   }
   async function collectKeys(tx, rows) {
     const objects = rows.filter(row => row.object_key);
-    if (objects.length) await tx.query(`INSERT INTO chatcode_object_cleanup(object_key, byte_count, room)
+    if (objects.length) await query(tx,"queue_cleanup",`INSERT INTO chatcode_object_cleanup(object_key, byte_count, room)
       SELECT * FROM unnest($1::text[], $2::integer[], $3::text[]) ON CONFLICT DO NOTHING`,
       [objects.map(r=>r.object_key), objects.map(r=>r.byte_count), objects.map(r=>r.room)]);
   }
   async function trim(tx,room) {
-    const deleted=await tx.query(`DELETE FROM chatcode_messages WHERE room=$1 AND seq IN
+    const deleted=await query(tx,"prune_history",`DELETE FROM chatcode_messages WHERE room=$1 AND seq IN
       (SELECT seq FROM chatcode_messages WHERE room=$1 ORDER BY seq DESC OFFSET 100) RETURNING object_key,byte_count,room`,[room]);
     await collectKeys(tx,deleted.rows);
   }
@@ -126,7 +133,7 @@ export async function openStorage() {
     },
     async receipt(code,clientId) {
       if(!clientId)return null;
-      const {rows}=await db.query("SELECT message_id FROM chatcode_messages WHERE room=$1 AND client_id=$2",[roomId(code),clientId]);
+      const {rows}=await query(db,"read_receipt","SELECT message_id FROM chatcode_messages WHERE room=$1 AND client_id=$2",[roomId(code),clientId]);
       return rows[0]?.message_id;
     },
     async save(code,event,clientId,file) {
@@ -134,36 +141,36 @@ export async function openStorage() {
       const objectKey=file ? file.objectKey || media.newKey() : null;
       if(objectKey){
         // The reservation survives a crash between PUT and the message commit.
-        await db.transaction(async tx=>{
-          await tx.query("SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+        await storageStep("postgres.reserve_transaction",()=>db.transaction(async tx=>{
+          await query(tx,"lock_budget","SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
           if(file.objectKey){
             // A lost commit acknowledgement must never queue a published object for deletion.
-            const reserved=await tx.query("SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now()",[objectKey]);
+            const reserved=await query(tx,"find_reservation","SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now()",[objectKey]);
             if(!reserved.rows.length)throw expiredReservation();
             return;
           }
           await checkSpace(tx,room,file.bytes.length);
-          await tx.query(`INSERT INTO chatcode_object_cleanup(object_key,due,byte_count,room)
+          await query(tx,"insert_reservation",`INSERT INTO chatcode_object_cleanup(object_key,due,byte_count,room)
             VALUES($1,now()+interval '1 hour',$2,$3)`,[objectKey,file.bytes.length,room]);
-        });
+        }));
         file.objectKey=objectKey;
         await media.put(objectKey,file.bytes);
       }
-      await db.transaction(async tx=>{
+      await storageStep("postgres.publish_transaction",()=>db.transaction(async tx=>{
         // Serialize retention and storage-budget decisions in the same transaction.
-        await tx.query("SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
+        await query(tx,"lock_budget","SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
         if(objectKey){
-          const claimed=await tx.query("DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now() RETURNING object_key",[objectKey]);
+          const claimed=await query(tx,"claim_reservation","DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now() RETURNING object_key",[objectKey]);
           if(!claimed.rows.length)throw expiredReservation();
         }
         if(file && !objectKey)await checkSpace(tx,room,file.bytes.length);
-        await tx.query(`INSERT INTO chatcode_messages
+        await query(tx,"insert_message",`INSERT INTO chatcode_messages
           (room,message_id,client_id,payload,attachment_id,byte_count,ciphertext,object_key)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,[
           room,event.id,clientId||null,JSON.stringify(event),file?.info.id||null,
           file?.bytes.length||0,file&&!objectKey?file.bytes:null,objectKey]);
         await trim(tx,room);
-      });
+      }));
     },
     async readFile(code,id) {
       const {rows}=await db.query("SELECT ciphertext,object_key FROM chatcode_messages WHERE room=$1 AND attachment_id=$2",[roomId(code),id]);
