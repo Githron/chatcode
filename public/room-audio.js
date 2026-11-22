@@ -2,13 +2,19 @@ import {unseal} from "./transfer.js";
 
 export function roomAudio(button, resume, socket, emit, notice, onState, onTick) {
   let session, snapshot, frame, audio, track, request, blobUrl, timer;
-  let listening=false, blocked=false, starting=false, reposition=true, retryAt=0;
+  let listening=false, blocked=false, starting=false, retryAt=0;
   const volume=document.getElementById("music-volume"), mute=document.getElementById("music-mute");
   let muted=false;
+  let reposition=true, settling=false;
+  const diagnosticsEnabled=(()=>{try{return new URLSearchParams(location.search).has("audioDebug")||localStorage.getItem("chatcodeAudioDiagnostics")==="1";}catch{return false;}})();
+  const audioDiagnostics=diagnosticsEnabled?[]:null;
+  const diagnosticEvents={waiting:0,stalled:0,seeking:0,seeked:0,playing:0,canplay:0,ratechange:0};
+  let diagnosticWrites=0;
+  let lastDiagnosticTime=null,lastDiagnosticCurrentTime=null;
   let offset=null, lastSync=-Infinity, syncing=false;
 
   function label() {
-    button.hidden=!session;
+    button.hidden=!session && !listening;
     button.setAttribute("aria-pressed",String(listening));
     resume.hidden=!blocked || !snapshot?.playing;
     button.textContent=listening ? "Listening" : "Listen Together";
@@ -32,12 +38,21 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
     blocked=false;
     retryAt=0;
     reposition=true;
+    settling=false;
   }
   function stop() {
     clearTrack();
     if (frame) {frame.onload=null;frame.remove();}
     frame=audio=null;
     label();
+  }
+  function disconnect() {
+    clearInterval(timer);
+    syncing=false;
+    offset=null;
+    lastSync=-Infinity;
+    session=snapshot=null;
+    stop();
   }
   function fail(message) {
     listening=false;
@@ -50,12 +65,42 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
     const elapsed=snapshot.playing ? Math.max(0,now-Date.parse(snapshot.anchor_time)) : 0;
     return Math.min(snapshot.duration_ms || 0,snapshot.position_ms+elapsed);
   }
+  function statusText() {
+    if (!listening || !snapshot?.playing || muted) return "";
+    if (blocked) return "Audio needs a tap";
+    if (retryAt>performance.now()) return "Audio busy · retrying";
+    if (!blobUrl || !audio || audio.readyState<audio.HAVE_FUTURE_DATA) return "Loading audio…";
+    return audio.seeking ? "Seeking…" : "";
+  }
   function align() {
     if (!audio || !snapshot || !blobUrl || audio.readyState<1 || offset===null) return;
     const duration=Math.min(audio.duration,snapshot.duration_ms/1000);
     const target=Math.min(duration,position()/1000);
-    if (reposition || Math.abs(audio.currentTime-target)>0.12) audio.currentTime=target;
-    reposition=false;
+    // A finished track may have no future data until we seek away from its end.
+    if ((!blocked || !snapshot.playing) && !audio.seeking && (audio.readyState>=audio.HAVE_FUTURE_DATA || audio.ended)) {
+      const drift=target-audio.currentTime;
+      let rate=1;
+      const needsCorrection=Math.abs(drift)>0.12 || (reposition && !snapshot.playing && drift!==0);
+      // Repositioning, paused rooms and large gaps need a hard seek. Smaller gaps are
+      // closed by nudging playback speed so normal playback does not stall or flicker.
+      const hardSeek=reposition || !snapshot.playing || audio.paused || Math.abs(drift)>0.5;
+      if (needsCorrection) {
+        if (settling && !reposition && snapshot.playing && !audio.paused && target<duration) {
+          // A completed seek left a residual gap; close it without another hard seek.
+          rate=1+Math.sign(drift)*0.1;
+        } else if (!hardSeek && snapshot.playing && !audio.paused && target<duration) {
+          // Close ordinary small drifts by nudging speed instead of seeking.
+          rate=1+Math.sign(drift)*0.1;
+          settling=true;
+        } else {
+          audio.currentTime=target;
+          diagnosticWrites++;
+          settling=snapshot.playing;
+        }
+      } else settling=false;
+      reposition=false;
+      if (audio.playbackRate!==rate) audio.playbackRate=rate;
+    }
     if (!snapshot.playing || target>=duration || audio.ended && duration-audio.currentTime<0.12) {
       audio.pause();
       return;
@@ -150,7 +195,14 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
       if (!audio) return fail("The room audio player could not open.");
       audio.volume=Number(volume.value)/100;
       audio.muted=muted;
-      audio.onloadedmetadata=audio.oncanplay=align;
+      audio.onloadedmetadata=align;
+      audio.onseeking=()=>{if(diagnosticsEnabled)diagnosticEvents.seeking++; onTick();};
+      audio.onseeked=()=>{if(diagnosticsEnabled)diagnosticEvents.seeked++; onTick();};
+      audio.onwaiting=()=>{if(diagnosticsEnabled)diagnosticEvents.waiting++; onTick();};
+      audio.onstalled=()=>{if(diagnosticsEnabled)diagnosticEvents.stalled++; onTick();};
+      audio.onplaying=()=>{if(diagnosticsEnabled)diagnosticEvents.playing++; onTick();};
+      audio.oncanplay=()=>{if(diagnosticsEnabled)diagnosticEvents.canplay++; align(); onTick();};
+      audio.onratechange=()=>{if(diagnosticsEnabled)diagnosticEvents.ratechange++;};
       audio.onerror=()=>{if (blobUrl) fail("This MP3 could not be decoded on this device.");};
       update();
     };
@@ -175,7 +227,7 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
   };
   resume.onclick=()=>{blocked=false;label();align();};
   button.onclick=()=>{
-    if (!session) return;
+    if (!session && !listening) return;
     listening=!listening;
     if (listening) start(); else stop();
   };
@@ -183,18 +235,34 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
     if (session && !document.hidden) synchronize();
   });
   window.addEventListener("pagehide",()=>{listening=false;stop();});
+  if (diagnosticsEnabled) {
+    const copyDiagnostics=()=>{
+      const payload=JSON.stringify({userAgent:navigator.userAgent,eventCounts:diagnosticEvents,writes:diagnosticWrites,samples:audioDiagnostics},null,2);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(payload).then(()=>notice("Copied audio diagnostics")).catch(()=>{console.log(payload);notice("Audio diagnostics logged to console");});
+      } else {
+        console.log(payload);
+        notice("Audio diagnostics logged to console");
+      }
+    };
+    window.chatcodeCopyAudioDiagnostics=copyDiagnostics;
+    const diagnosticButton=document.createElement("button");
+    diagnosticButton.type="button";
+    diagnosticButton.textContent="Copy audio diagnostics";
+    diagnosticButton.style.cssText="position:fixed;right:8px;bottom:8px;z-index:9999;padding:6px 8px;font:12px sans-serif;";
+    diagnosticButton.onclick=copyDiagnostics;
+    if (document.body) document.body.appendChild(diagnosticButton);
+  }
   return {
     accept,
+    disconnect,
     position,
-    get status() {
-      if (!listening || !snapshot?.playing || muted) return "";
-      if (blocked) return "Audio needs a tap";
-      if (retryAt>performance.now()) return "Audio busy · retrying";
-      return !blobUrl || !audio || audio.readyState<2 ? "Loading audio…" : "";
-    },
+    get status() { return statusText(); },
     join(current) {
+      // The server can acknowledge another join for the same membership.
+      if (session && current && session.room===current.room && session.token===current.token) return;
+      if (session) disconnect();
       session=current;
-      clearInterval(timer);
       if (current) {
         synchronize();
         timer=setInterval(()=>{
@@ -202,17 +270,29 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
           if (performance.now()-lastSync>sampleInterval) synchronize();
           update();
           if (snapshot?.playing && !document.hidden) onTick();
+          if (diagnosticsEnabled && audio) {
+            const bufferedEnd=audio.buffered && audio.buffered.length ? audio.buffered.end(audio.buffered.length-1) : null;
+            const advanced=lastDiagnosticCurrentTime===null ? null : Number((audio.currentTime-lastDiagnosticCurrentTime).toFixed(3));
+            audioDiagnostics.push({
+              t:Math.round(performance.now()),
+              status:statusText(),
+              readyState:audio.readyState,
+              seeking:audio.seeking,
+              paused:audio.paused,
+              currentTime:Number(audio.currentTime.toFixed(3)),
+              advanced,
+              playbackRate:audio.playbackRate,
+              bufferedEnd:bufferedEnd===null?null:Number(bufferedEnd.toFixed(3)),
+              bufferedAhead:bufferedEnd===null?null:Number((bufferedEnd-audio.currentTime).toFixed(3)),
+              writes:diagnosticWrites
+            });
+            if (audioDiagnostics.length>300) audioDiagnostics.shift();
+            lastDiagnosticTime=performance.now();
+            lastDiagnosticCurrentTime=audio.currentTime;
+          }
         },250);
       } else listening=false;
       if (listening && current) start(); else label();
-    },
-    disconnect() {
-      clearInterval(timer);
-      syncing=false;
-      offset=null;
-      lastSync=-Infinity;
-      session=snapshot=null;
-      stop();
     }
   };
 }

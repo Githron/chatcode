@@ -82,10 +82,22 @@ export async function playbackBrowser(t, url, room, bytes, restart, samples) {
   for (const page of [a,b]) await page.click("#show-queue");
   await b.click("li:nth-child(2) summary");await b.click('button[data-action="up"]');
   await until(()=>a.run('return document.querySelector(".track-name").textContent==="After Hours.mp3"'),"remote reorder");
+  await a.click('button[aria-label="Select Night Drive.mp3"]');
+  await until(()=>b.run('return document.querySelector("#playing-name").textContent==="Night Drive.mp3"'),"first paused selection");
   await a.click('button[aria-label="Select After Hours.mp3"]');
-  await until(()=>b.run('return document.querySelector("#playing-name").textContent==="After Hours.mp3"'),"selected track");
+  for (const page of [a,b]) {
+    await until(()=>page.run('return document.querySelector("#playing-name").textContent==="After Hours.mp3" && document.querySelector("#playing-detail").textContent.startsWith("Paused · 0:00")'),"paused switch on both devices");
+    assert.equal(await page.run("return Boolean("+audio+")"),false);
+  }
   await a.click("#music-play");
   for (const page of [a,b]) await page.click("#music-view-toggle");
+  // Hold A's authorized fetch while B plays and A receives a new room position.
+  await a.run(`const fetchTrack=window.fetch; window.trackReads=0;
+    window.fetch=async (...args)=>{
+      if (String(args[0]).startsWith("/api/music/tracks/") && ++trackReads===1)
+        await new Promise(resolve=>{window.releaseTrack=resolve;});
+      return fetchTrack(...args);
+    }`);
   for (const page of [a,b]) {
     await until(()=>page.run('return !document.querySelector("#listen-btn").hidden'),"room supports playback");
     assert.equal(await page.run('return performance.getEntriesByType("resource").some(e=>e.name.includes("/api/music/tracks/"))'),false);
@@ -97,7 +109,37 @@ export async function playbackBrowser(t, url, room, bytes, restart, samples) {
       await page.click("#resume-audio");
     return page.run(`const audio=${audio}; return audio && !audio.paused && audio.currentTime>0 && audio.readyState>=2`);
   }
+  await until(()=>playing(b),"B plays while A is loading");
+  await range(a,"music-seek",4000);
+  await until(()=>b.run("return "+audio+".currentTime>=4"),"remote seek during A's fetch");
+  assert.equal(await a.run('return trackReads===1 && document.querySelector("#playing-detail").textContent.startsWith("Loading audio")'),true);
+  await a.run("releaseTrack()");
   await until(async()=>(await Promise.all([playing(a),playing(b)])).every(Boolean),"both decrypted MP3s are playing");
+  await until(()=>a.run("return "+audio+".currentTime>=4"),"A plays from the seek received during its fetch");
+  assert.equal(await a.run("return trackReads"),1);
+  // Hold A's response for one selected song until both listeners are playing the next.
+  const reads=await a.run(`const original=window.fetch;
+    window.fetch=async (...args)=>{
+      if (!String(args[0]).startsWith("/api/music/tracks/")) return original(...args);
+      window.fetch=original;
+      const response=await original(...args);
+      await new Promise(resolve=>{window.releaseSelection=resolve;});
+      return response;
+    };
+    return trackReads`);
+  await b.click("#music-view-toggle");
+  await until(()=>b.run('return document.querySelector("#music-collection").getAttribute("aria-busy")==="false"'),"queue refreshed");
+  await b.click('button[aria-label="Select Night Drive.mp3"]');
+  await until(()=>a.run('return !!window.releaseSelection && document.querySelector("#playing-name").textContent==="Night Drive.mp3" && document.querySelector("#playing-detail").textContent.startsWith("Loading audio")'),"A awaits the selected MP3");
+  await until(()=>b.run(`return document.querySelector("#playing-name").textContent==="Night Drive.mp3" && !${audio}.paused && ${audio}.currentTime>0`),"B plays the selected song without pressing Play");
+  await b.click('button[aria-label="Select After Hours.mp3"]');
+  for (const page of [a,b]) await until(()=>page.run(`return document.querySelector("#playing-name").textContent==="After Hours.mp3" &&
+    !${audio}.paused && ${audio}.currentTime>0 && document.querySelector("#playing-detail").textContent.startsWith("Playing")`),"both play the latest selection");
+  const selectedUrl=await a.run("releaseSelection();return "+audio+".currentSrc");
+  await until(async()=>await clockGap()<=500,"selected song in sync");
+  assert.equal(await a.run("return "+audio+".currentSrc"),selectedUrl);
+  assert.equal(await a.run("return trackReads"),reads+2);
+  await b.click("#music-view-toggle");
   const firstUrl=await a.run("return "+audio+".currentSrc");
   await a.click("#player-toggle");
   await a.click("#music-next");
@@ -129,17 +171,105 @@ export async function playbackBrowser(t, url, room, bytes, restart, samples) {
     const y=p.getBoundingClientRect().top;h.scrollTop=h.scrollHeight;const bottom=h.scrollTop;h.scrollTop=0;
     const pinned=bottom>0 && p.getBoundingClientRect().top===y;h.scrollTop=h.scrollHeight;
     return pinned && ${audio}.currentSrc===arguments[0]`,retained));
+  await t.test("a buffered seek with an advancing media clock has a seek status",async()=>{
+    const start=await b.run(`const media=${audio};
+      Object.defineProperty(media,"seeking",{configurable:true,value:true});
+      return media.currentTime`);
+    try {
+      await until(()=>b.run(`return ${audio}.readyState>=3 && ${audio}.currentTime>arguments[0]+0.35`,start),"buffered media clock advanced through a UI tick");
+      assert.match(await b.run('return document.querySelector("#playing-detail").textContent'),/^Seeking/);
+    } finally { await b.run(`delete ${audio}.seeking`); }
+    assert.match(await b.run(`const media=${audio};media.dispatchEvent(new Event("seeked"));
+      media.dispatchEvent(new Event("stalled"));
+      return document.querySelector("#playing-detail").textContent`),/^Playing/);
+  });
+  // Hold the native seek on A across snapshots and timer ticks. B uses its real decoder.
+  await a.run(`const media=${audio}, proto=media.ownerDocument.defaultView.HTMLMediaElement.prototype;
+    const time=Object.getOwnPropertyDescriptor(proto,"currentTime");
+    const seeking=Object.getOwnPropertyDescriptor(proto,"seeking");
+    window.seekProbe={writes:[],rates:[],ready:4,seeking:true,reads:trackReads,media,url:media.currentSrc};
+    media.addEventListener("ratechange",()=>seekProbe.rates.push(media.playbackRate));
+    Object.defineProperties(media,{
+      currentTime:{configurable:true,get:()=>seekProbe.landed ? time.get.call(media) : 0,set:value=>{
+        seekProbe.writes.push(value);
+        if (seekProbe.deliver) {
+          seekProbe.seeking=true;
+          setTimeout(()=>{time.set.call(media,value);seekProbe.landed=true;seekProbe.seeking=false;},650);
+        }
+      }},
+      seeking:{configurable:true,get:()=>seekProbe.seeking || seeking.get.call(media)},
+      readyState:{configurable:true,get:()=>seekProbe.ready}
+    });
+    media.dispatchEvent(new Event("seeking"))`);
+  await b.run(`const media=${audio};window.nativeSeekEvents=[];
+    for (const event of ["seeking","waiting","stalled","seeked","canplay","playing"])
+      media.addEventListener(event,()=>nativeSeekEvents.push(event+"="+media.readyState),{once:true});`);
+  for (const target of [12000,2000]) {
+    await range(a,"music-seek",target);
+    await until(()=>b.run(`return Math.abs(${audio}.currentTime*1000-arguments[0])<1500`,target),"B applied active seek");
+    await until(()=>a.run('return !document.querySelector("#music-seek").disabled'),"seek acknowledged");
+  }
+  assert.deepEqual(await a.run("return seekProbe.writes"),[],"no currentTime writes during an unfinished seek");
+  for (const [ready,event] of [[1,"waiting"],[2,"stalled"]]) {
+    await a.run(`seekProbe.seeking=false; seekProbe.ready=arguments[0];seekProbe.media.dispatchEvent(new Event(arguments[1]))`,ready,event);
+    await delay(550); // Cross two 250 ms alignment ticks with insufficient data.
+    assert.deepEqual(await a.run("return seekProbe.writes"),[],"no corrections while buffering");
+    assert.ok(await a.run('return document.querySelector("#playing-detail").textContent.startsWith("Loading audio")'));
+  }
+  await a.run(`const {media}=seekProbe;
+    delete media.readyState;
+    seekProbe.deliver=true;
+    media.dispatchEvent(new Event("canplay"))`);
+  async function clockGap() {
+    // Exclude the time between the two WebDriver observations.
+    const clocks=await Promise.all([a,b].map(page=>page.run(`return ${audio}.currentTime*1000-Date.now()`)));
+    return Math.round(Math.abs(clocks[0]-clocks[1]));
+  }
+  await until(async()=>await a.run('return seekProbe.writes.length>0 && !seekProbe.media.seeking && document.querySelector("#playing-detail").textContent.startsWith("Playing")')
+    && await clockGap()<=500,"A recovered at B's room position").catch(async error=>{
+      for (const page of [a,b]) t.diagnostic(JSON.stringify(await page.run(`const media=${audio};return {
+        roomMs:document.querySelector("#music-seek").value,local:media.currentTime,rate:media.playbackRate,
+        detail:document.querySelector("#playing-detail").textContent,paused:media.paused,
+        seeking:media.seeking,ready:media.readyState,writes:window.seekProbe?.writes
+      }`)));
+      throw error;
+    });
+  await until(()=>a.run("return seekProbe.media.playbackRate===1"),"normal tempo resumes after catch-up");
+  t.diagnostic("Native seek events on B and their readyState: "+await b.run("return nativeSeekEvents.join(', ')"));
+  t.diagnostic("Local rate changes during delayed seek recovery: "+await a.run("return seekProbe.rates.join(', ')"));
+  t.diagnostic("Two foreground media clocks after a delayed authoritative seek: "+await clockGap()+" ms apart");
+  assert.equal(await a.run("return seekProbe.writes.length"),1,"a slow completed seek can settle without another hard seek");
+  await a.run("delete seekProbe.media.currentTime;delete seekProbe.media.seeking");
+  assert.ok(await a.run(`return seekProbe.media===${audio} && seekProbe.url===${audio}.currentSrc && trackReads===seekProbe.reads`));
   await b.run(`const media=${audio}; media.currentTime+=2`);
   await delay(1500);
   const gaps=[];
   for (let i=0;i<8;i++) {
-    // Subtract observation time so independent WebDriver request latency does not count as drift.
-    const [first,second]=await Promise.all([a,b].map(page=>page.run(`return ${audio}.currentTime*1000-Date.now()`)));
-    gaps.push(Math.round(Math.abs(first-second)));
+    gaps.push(await clockGap());
     await delay(200);
   }
   t.diagnostic("Two foreground media clocks, settled gaps in ms: "+gaps.join(", "));
   assert.ok(Math.max(...gaps)<=500);
+  await t.test("uninterrupted playback does not flicker between Playing and Loading",async()=>{
+    const statusesA=[],statusesB=[];
+    const started=Date.now();
+    while (Date.now()-started<20000) {
+      const [sa,sb]=await Promise.all([
+        a.run('return document.querySelector("#playing-detail").textContent.split(" · ")[0]'),
+        b.run('return document.querySelector("#playing-detail").textContent.split(" · ")[0]')
+      ]);
+      statusesA.push(sa);statusesB.push(sb);
+      await delay(250);
+    }
+    const transitionsA=statusesA.reduce((n,s,i)=>i && s!==statusesA[i-1]?n+1:n,0);
+    const transitionsB=statusesB.reduce((n,s,i)=>i && s!==statusesB[i-1]?n+1:n,0);
+    const loadingA=statusesA.filter(s=>s==="Loading audio…").length;
+    const loadingB=statusesB.filter(s=>s==="Loading audio…").length;
+    t.diagnostic("A statuses: "+[...new Set(statusesA)].join(" | ")+" transitions="+transitionsA+" loading="+loadingA+" samples="+statusesA.length);
+    t.diagnostic("B statuses: "+[...new Set(statusesB)].join(" | ")+" transitions="+transitionsB+" loading="+loadingB+" samples="+statusesB.length);
+    assert.equal(loadingA,0,"unexpected Loading audio status on A during uninterrupted playback");
+    assert.equal(loadingB,0,"unexpected Loading audio status on B during uninterrupted playback");
+  });
   await a.click("#music-play");
   await until(async()=>(await Promise.all([a,b].map(page=>page.run("return "+audio+".paused")))).every(Boolean),"room paused");
   await range(a,"music-seek",6000);
@@ -152,11 +282,72 @@ export async function playbackBrowser(t, url, room, bytes, restart, samples) {
   await until(()=>b.run('return !document.querySelector("#resume-audio").hidden'),"autoplay fallback");
   await b.click("#resume-audio");
   await until(()=>playing(b),"gesture resumes at room position");
-  const mutedUrl=await b.run("return "+audio+".currentSrc");
+  await range(b,"music-volume",65);
+  const uninterrupted=await a.run(`return {src:${audio}.currentSrc,time:${audio}.currentTime}`);
+  const mutedUrl=await b.run(`window.playingBeforeOff=${audio};
+    document.querySelector("#join-form").requestSubmit();
+    return playingBeforeOff.currentSrc`);
+  await until(()=>b.run('return !document.querySelector("#join-btn").disabled'),"same-session join completed");
+  assert.ok(await b.run(`return playingBeforeOff===${audio} && playingBeforeOff.currentSrc===arguments[0] &&
+    document.querySelectorAll('iframe[src="/audio-player.html"]').length===1`,mutedUrl));
   await b.click("#listen-btn");
+  assert.deepEqual(await b.run(`return {
+    pressed:document.querySelector("#listen-btn").getAttribute("aria-pressed"),
+    frames:document.querySelectorAll('iframe[src="/audio-player.html"]').length,
+    paused:playingBeforeOff.paused,hasSource:playingBeforeOff.hasAttribute("src")
+  }`),{pressed:"false",frames:0,paused:true,hasSource:false},"OFF must silence the original element after a repeated join");
   assert.ok(await b.run("return revoked.includes(arguments[0])",mutedUrl));
   assert.equal(await b.run("return Boolean("+audio+")"),false);
   assert.ok(await playing(a));
+  await b.click("#listen-btn");
+  await until(()=>playing(b),"B opted back in during room playback");
+  assert.notEqual(await b.run("return "+audio+".currentSrc"),mutedUrl);
+  assert.equal(await b.run("return "+audio+".volume"),0.65);
+  await until(async()=>await clockGap()<=500,"re-enabled listener at room position");
+  assert.ok(await a.run(`return ${audio}.currentSrc===arguments[0].src && !${audio}.paused &&
+    ${audio}.currentTime>arguments[0].time && ${audio}.volume===0.35`,uninterrupted));
+  await b.click("#listen-btn");
+
+  await t.test("rapid toggles and a late encrypted response leave no local source",async()=>{
+    await b.run(`const original=window.fetch;
+      window.fetch=async (...args)=>{
+        if (!String(args[0]).startsWith("/api/music/tracks/")) return original(...args);
+        window.fetch=original;
+        window.pendingSignal=args[1].signal;
+        const result=await original(...args);
+        await new Promise(resolve=>{window.finishRead=resolve;});
+        return result;
+      };
+      const btn=document.querySelector("#listen-btn");
+      btn.click();btn.click();btn.click();`);
+    await until(()=>b.run("return !!window.finishRead"),"authorized music response held");
+    assert.equal(await b.run(`return document.querySelectorAll('iframe[src="/audio-player.html"]').length`),1);
+    await b.click("#listen-btn");
+    assert.ok(await b.run("finishRead(); return pendingSignal.aborted"));
+    assert.equal(await b.run("return Boolean("+audio+")"),false);
+  });
+
+  await t.test("turning listening off during track decryption discards the late result",async()=>{
+    await b.click("#listen-btn");
+    await until(()=>playing(b),"B ready before the track switch");
+    await b.run(`const decrypt=crypto.subtle.decrypt.bind(crypto.subtle);
+      crypto.subtle.decrypt=async (...args)=>{
+        delete crypto.subtle.decrypt;
+        const bytes=await decrypt(...args);
+        await new Promise(resolve=>{window.finishDecrypt=resolve;});
+        return bytes;
+      };
+      window.switchMedia=${audio}; window.lateBlobs=0;
+      const create=URL.createObjectURL.bind(URL);
+      URL.createObjectURL=blob=>{lateBlobs++;return create(blob);};`);
+    await a.click("#music-next");
+    await until(()=>b.run("return !!window.finishDecrypt"),"decryption held during the switch");
+    await b.click("#listen-btn");
+    await b.run("finishDecrypt()");
+    assert.ok(await b.run(`return !${audio} && switchMedia.paused && !switchMedia.hasAttribute("src") &&
+      lateBlobs===0 && document.querySelector("#listen-btn").getAttribute("aria-pressed")==="false"`));
+    await until(()=>playing(a),"A continues with the selected track");
+  });
   for (const [name,bytes] of Object.entries(samples)) {
     await a.run(`const selected=new DataTransfer(), input=document.querySelector("#file-input");
       selected.items.add(new File([Uint8Array.from(atob(arguments[1]),c=>c.charCodeAt(0))],arguments[0]));
@@ -177,6 +368,21 @@ export async function playbackBrowser(t, url, room, bytes, restart, samples) {
         "decoded "+name);
     }
   }
+  await t.test("a listener can opt out while the server is disconnected",async()=>{
+    await b.click("#listen-btn");
+    await until(()=>playing(b),"B is listening before disconnection");
+    await restart(async()=>{
+      await until(()=>b.run('return document.querySelector("#network").textContent==="Reconnecting…"'),"B disconnected");
+      assert.equal(await b.run("return Boolean("+audio+")"),false);
+      await b.click("#listen-btn");
+      assert.equal(await b.run('return document.querySelector("#listen-btn").getAttribute("aria-pressed")'),"false");
+    });
+    for (const page of [a,b]) await until(()=>page.run(`return document.querySelector("#network").textContent==="Connected" &&
+      !document.querySelector("#music-play").disabled && document.querySelector("#playing-detail").textContent.startsWith("Paused")`),"room rejoined");
+    await a.click("#music-play");
+    await until(()=>playing(a),"A resumed after the reconnect");
+    assert.equal(await b.run("return Boolean("+audio+")"),false);
+  });
   const oldUrl=await a.run("return "+audio+".currentSrc");
   await restart();
   await until(()=>a.run(`const media=${audio};
@@ -186,6 +392,7 @@ export async function playbackBrowser(t, url, room, bytes, restart, samples) {
   assert.equal(await b.run("return Boolean("+audio+")"),false);
   await a.click("#music-play");
   await until(()=>playing(a),"rejoined browser resumed");
+  assert.ok(await b.run(`return !${audio} && document.querySelector("#listen-btn").getAttribute("aria-pressed")==="false"`));
   await b.click("#music-view-toggle");
   await until(()=>b.run('return !!document.querySelector("#music-tracks li:first-child details")'),"Browser B music catalog is ready");
   if (!await b.run('return document.querySelector("#music-tracks li:first-child details").open')) await b.click("#music-tracks li:first-child summary");

@@ -163,8 +163,9 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
     assert.match(markup,/<video controls playsinline preload="none"/);
     assert.doesNotMatch(markup,/<script|<source|\s(?:autoplay|src)=/i);
   });
-  async function restart(port=0){
+  async function restart(port=0,whileStopped){
     const ended=once(server,"exit");server.kill();await ended;
+    if (whileStopped) await whileStopped();
     server=start(port);url=await address();
   }
   const connect=async()=>{
@@ -742,7 +743,7 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
       await restart();
       const {playbackBrowser}=await import("./test/playback-browser.mjs");
       await pt.test("two foreground browsers follow the room after drift, autoplay denial and reconnect",
-        bt=>playbackBrowser(bt,url,room+"-ui",bytes,()=>restart(Number(new URL(url).port)),{"test.png":png,"clip.mp4":mp4,"clip.webm":webm}));
+        bt=>playbackBrowser(bt,url,room+"-ui",bytes,whileStopped=>restart(Number(new URL(url).port),whileStopped),{"test.png":png,"clip.mp4":mp4,"clip.webm":webm}));
     }
   });
 

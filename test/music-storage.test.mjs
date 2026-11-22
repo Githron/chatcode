@@ -279,6 +279,43 @@ test("music storage migration and lifecycle", async t => {
     assert.equal((await music.snapshot(code)).revision,"4");
   });
 
+  await t.test("queue selection preserves the locked playback state across competing taps and retries",async()=>{
+    const music=store.music, code="queue-selection";
+    const input=(revision,action,fields)=>({commandId:randomUUID(),expectedRevision:revision,action,...fields});
+    for (const revision of ["1","3","5"]) {
+      const trackId=randomUUID();
+      await music.saveUpload(code,trackId,track,Buffer.alloc(track.sizeBytes+28),()=>true);
+      assert.ok((await music.queueCommand(code,input(revision,"add",{trackId}))).ok);
+    }
+    const [first,second,third]=(await music.snapshot(code)).queue.map(entry=>entry.entry_id);
+    const playing=await music.playbackCommand(code,input("6","play"));
+    assert.ok(playing.ok);
+    const taps=[second,third].map(entryId=>input(playing.appliedRevision,"select",{entryId}));
+    const earliest=Date.now();
+    const results=await Promise.all(taps.map(tap=>music.queueCommand(code,tap)));
+    const winner=results.findIndex(result=>result.ok);
+    assert.ok(winner>=0);
+    assert.equal(results[1-winner].code,"stale_revision");
+    const selected=await music.playbackSnapshot(code);
+    assert.equal(selected.current_entry,taps[winner].entryId);
+    assert.equal(selected.revision,"8");
+    assert.equal(selected.playing,true);
+    assert.equal(selected.position_ms,0);
+    assert.ok(new Date(selected.anchor_time).getTime()>=earliest);
+    assert.equal(await music.advanceIfEnded(code,playing.appliedRevision,()=>true),false);
+
+    assert.ok((await music.playbackCommand(code,input(selected.revision,"pause"))).ok);
+    assert.ok((await music.queueCommand(code,input("9","select",{entryId:first}))).ok);
+    const paused=await music.playbackSnapshot(code);
+    assert.equal(paused.current_entry,first);
+    assert.equal(paused.revision,"10");
+    assert.equal(paused.playing,false);
+    assert.equal(paused.position_ms,0);
+    assert.equal(paused.anchor_time,null);
+    assert.ok((await music.queueCommand(code,taps[winner])).replayed);
+    assert.deepEqual(await music.playbackSnapshot(code),paused);
+  });
+
   await t.test("only one track-end or member command can consume a playback revision",async()=>{
     const music=store.music, code="playback-boundaries", trackId=randomUUID();
     await music.saveUpload(code,trackId,track,Buffer.alloc(track.sizeBytes+28),()=>true);

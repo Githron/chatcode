@@ -71,8 +71,9 @@ export async function applyQueueEdit(tx, room, {action,argument}) {
   let result;
   if (action==="select") {
     result=await tx.query(`UPDATE chatcode_music_playback p SET current_entry=q.entry_id,
-      playing=false, position_ms=0, anchor_time=NULL FROM chatcode_music_queue q
-      WHERE p.room=$1 AND q.room=p.room AND q.entry_id=$2 RETURNING q.entry_id`,[room,argument]);
+      position_ms=0, anchor_time=CASE WHEN p.playing THEN $3::timestamptz ELSE NULL END
+      FROM chatcode_music_queue q WHERE p.room=$1 AND q.room=p.room AND q.entry_id=$2
+      RETURNING q.entry_id`,[room,argument,new Date()]);
   } else if (action==="remove") {
     await resetCurrent(tx,room,[argument]);
     result=await tx.query("DELETE FROM chatcode_music_queue WHERE room=$1 AND entry_id=$2 RETURNING entry_id",[room,argument]);
