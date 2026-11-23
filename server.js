@@ -34,6 +34,12 @@ const io = new Server(server, { maxHttpBufferSize: 24 * 1024 });
 const rooms = new Map();
 const sessions = new Map();
 const channel = code => "chatcode:" + code;
+
+// Listening status is ephemeral room state, keyed by socket.id
+function members(peer) {
+  const list = [...peer.state.members].map(([id, p]) => ({ id, username: p.username, listening: p.listening }));
+  io.to(channel(peer.room)).emit("members_update", { members: list });
+}
 attachmentRoutes(app, sessions, storage, musicUploads || musicPlayback ? storage.music : null, musicUploads, room=>{
   io.to(channel(room)).emit("music_library_changed");
   if (musicPlayback) refreshPlayback(room);
@@ -108,11 +114,6 @@ function scheduleFreeze(room) {
   });
 }
 
-function members(peer) {
-  const list = [...peer.state.members].map(([id, p]) => ({ id, username: p.username }));
-  io.to(channel(peer.room)).emit("members_update", { members: list });
-}
-
 io.on("connection", socket => {
   let peer, pending=0;
   let recentQueueRequests=[];
@@ -155,13 +156,25 @@ io.on("connection", socket => {
     const authorId=createHash("sha256").update(room+"|"+(uuid(identity)?identity:randomUUID())).digest("hex");
     const state = rooms.get(room) || { members:new Map(), generation:0 };
     rooms.set(room,state);
-    peer = { room, username, authorId, token:randomBytes(32).toString("hex"), state, recent:[] };
+    peer = { room, username, authorId, token:randomBytes(32).toString("hex"), state, recent:[], listening:false };
     sessions.set(peer.token,peer);
     state.members.set(socket.id,peer);
     socket.join(channel(room));
     members(peer);
     socket.to(channel(room)).emit("user_joined",{message:username+" joined the room"});
     return {ok:true,token:peer.token,authorId,history,musicPlayback,musicQueue,musicUploads};
+  });
+  handle("listening", ({listening, room}) => {
+    if (!peer || typeof listening !== "boolean") return {ok:false,error:"Invalid request."};
+    if (!musicPlayback) return {ok:false,error:"Music playback not enabled."};
+    if (room !== peer.room) return {ok:false,error:"Room mismatch."};
+    const member = peer.state.members.get(socket.id);
+    if (!member) return {ok:false,error:"Not in a room."};
+    if (member.listening !== listening) {
+      member.listening = listening;
+      members(peer);
+    }
+    return {ok:true};
   });
   if (musicQueue || musicUploads) {
     handle(musicQueue ? "music_queue_get" : "music_library_get",async ({afterTrackId,includeUsage})=>{

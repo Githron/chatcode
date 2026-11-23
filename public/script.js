@@ -166,7 +166,15 @@ socket.on("members_update",({members})=>{
   $("members-list").replaceChildren(...members.map(m=>{
     const self=m.id===socket.id, li=make("li","member"+(self?" self":""));
     const avatar=make("span","avatar",m.username.slice(0,2).toUpperCase());avatar.setAttribute("aria-hidden","true");
-    li.append(avatar,make("span","member-name",m.username));if(self)li.append(make("small","","You"));return li;
+    const nameSpan=make("span","member-name",m.username);
+    if (m.listening) {
+      const listening=make("span","member-listening");
+      listening.append(icon("headphones"),document.createTextNode("Listening"));
+      nameSpan.appendChild(listening);
+    }
+    li.append(avatar,nameSpan);
+    if(self)li.append(make("small","","You"));
+    return li;
   }));
 });
 function atBottom(){return history.scrollHeight-history.scrollTop-history.clientHeight<64;}

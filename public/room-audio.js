@@ -56,6 +56,7 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
   }
   function fail(message) {
     listening=false;
+    socket.emit("listening", {listening:false, room: session?.room});
     stop();
     notice(message);
   }
@@ -229,12 +230,13 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
   button.onclick=()=>{
     if (!session && !listening) return;
     listening=!listening;
+    socket.emit("listening", {listening, room: session?.room});
     if (listening) start(); else stop();
   };
   document.addEventListener("visibilitychange",()=>{
     if (session && !document.hidden) synchronize();
   });
-  window.addEventListener("pagehide",()=>{listening=false;stop();});
+  window.addEventListener("pagehide",()=>{listening=false;socket.emit("listening", {listening:false, room: session?.room});stop();});
   if (diagnosticsEnabled) {
     const copyDiagnostics=()=>{
       const payload=JSON.stringify({userAgent:navigator.userAgent,eventCounts:diagnosticEvents,writes:diagnosticWrites,samples:audioDiagnostics},null,2);
@@ -261,7 +263,11 @@ export function roomAudio(button, resume, socket, emit, notice, onState, onTick)
     join(current) {
       // The server can acknowledge another join for the same membership.
       if (session && current && session.room===current.room && session.token===current.token) return;
-      if (session) disconnect();
+      if (session) {
+        listening=false;
+        socket.emit("listening", {listening:false, room: session.room});
+        disconnect();
+      }
       session=current;
       if (current) {
         synchronize();

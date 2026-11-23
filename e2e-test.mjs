@@ -777,4 +777,115 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
     assert.equal(blocked.headers.get("retry-after"),"60");
     assert.equal((await fetch(url+"/api/admin/storage")).status,403);
   });
+  await t.test("member listening indicator updates in real time",async()=>{
+    const code="listen-"+randomUUID().slice(0,8);
+    playbackEnabled=musicEnabled=queueEnabled=true;
+    await restart();
+    const a=await connect(), b=await connect(), c=await connect(), x=await connect();
+    function nextEvent(socket,event,accept=()=>true,timeout=8000) {
+      return new Promise((resolve,reject)=>{
+        const onData = data => {
+          if (!accept(data)) return;
+          socket.off(event,onData); clearTimeout(timer); resolve(data);
+        };
+        const timer=setTimeout(()=>{ socket.off(event,onData); reject(new Error("Timed out waiting for "+event)); },timeout);
+        socket.on(event,onData);
+      });
+    }
+    const joinMember=(client,name,room)=>request(client,"join_room",{username:name,room:room||code});
+    await joinMember(a,"Alice");
+    const aMembers=nextEvent(a,"members_update");
+    await joinMember(b,"Bob");
+    assert.deepEqual((await aMembers).members.map(m=>({username:m.username,listening:m.listening})),[
+      {username:"Alice",listening:false},{username:"Bob",listening:false}
+    ]);
+    // Reject missing room
+    assert.equal((await request(a,"listening",{listening:true})).ok,false);
+    // Reject incorrect room
+    assert.equal((await request(a,"listening",{listening:true,room:"wrong-room"})).ok,false);
+    // Reject cross-room (another room's code)
+    const otherCode="other-"+randomUUID().slice(0,8);
+    await joinMember(x,"Outsider",otherCode);
+    assert.equal((await request(a,"listening",{listening:true,room:otherCode})).ok,false);
+    x.disconnect();
+    // Valid request with correct room
+    const aListening=nextEvent(a,"members_update", m => m.members.some(x => x.username==="Alice" && x.listening===true));
+    const bMembers=nextEvent(b,"members_update", m => m.members.some(x => x.username==="Alice" && x.listening===true));
+    const listenResult=await request(a,"listening",{listening:true,room:code});
+    assert.equal(listenResult.ok,true);
+    const aMembersAfter=await aListening;
+    assert.deepEqual(aMembersAfter.members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:true},{username:"Bob",listening:false}
+    ]);
+    const bMembersAfter=await bMembers;
+    assert.deepEqual(bMembersAfter.members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:true},{username:"Bob",listening:false}
+    ]);
+    const aListening2=nextEvent(a,"members_update", m => m.members.some(x => x.username==="Bob" && x.listening===true));
+    const bListening2=nextEvent(b,"members_update", m => m.members.some(x => x.username==="Bob" && x.listening===true));
+    await request(b,"listening",{listening:true,room:code});
+    const aMembersAfter2=await aListening2;
+    const bMembersAfter2=await bListening2;
+    assert.deepEqual(aMembersAfter2.members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:true},{username:"Bob",listening:true}
+    ]);
+    assert.deepEqual(bMembersAfter2.members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:true},{username:"Bob",listening:true}
+    ]);
+    const aListening3=nextEvent(a,"members_update", m => m.members.some(x => x.username==="Alice" && x.listening===false));
+    const bListening3=nextEvent(b,"members_update", m => m.members.some(x => x.username==="Alice" && x.listening===false));
+    await request(a,"listening",{listening:false,room:code});
+    const aMembersAfter3=await aListening3;
+    const bMembersAfter3=await bListening3;
+    assert.deepEqual(aMembersAfter3.members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:false},{username:"Bob",listening:true}
+    ]);
+    assert.deepEqual(bMembersAfter3.members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:false},{username:"Bob",listening:true}
+    ]);
+    const bMembersAfter4=nextEvent(b,"members_update");
+    a.disconnect();
+    assert.deepEqual((await bMembersAfter4).members.map(m=>({username:m.username,listening:m.listening})),[
+      {username:"Bob",listening:true}
+    ]);
+    const cMembers=nextEvent(c,"members_update");
+    await joinMember(c,"Casey");
+    assert.deepEqual((await cMembers).members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Bob",listening:true},{username:"Casey",listening:false}
+    ]);
+    b.disconnect();
+    c.disconnect();
+    playbackEnabled=queueEnabled=false;
+    await restart();
+  });
+  await t.test("listening indicator disabled when music playback is off",async()=>{
+    const code="listen-off-"+randomUUID().slice(0,8);
+    playbackEnabled=false; queueEnabled=true; musicEnabled=true;
+    await restart();
+    const a=await connect(), b=await connect();
+    function nextEvent(socket,event,accept=()=>true,timeout=8000) {
+      return new Promise((resolve,reject)=>{
+        const onData = data => {
+          if (!accept(data)) return;
+          socket.off(event,onData); clearTimeout(timer); resolve(data);
+        };
+        const timer=setTimeout(()=>{ socket.off(event,onData); reject(new Error("Timed out waiting for "+event)); },timeout);
+        socket.on(event,onData);
+      });
+    }
+    const joinMember=(client,name,room)=>request(client,"join_room",{username:name,room:room||code});
+    await joinMember(a,"Alice");
+    const aMembers=nextEvent(a,"members_update");
+    await joinMember(b,"Bob");
+    // Listening event should be rejected when music playback is disabled
+    const result=await request(a,"listening",{listening:true,room:code});
+    assert.equal(result.ok,false);
+    // Members should show listening:false
+    assert.deepEqual((await aMembers).members.map(m=>({username:m.username,listening:m.listening})).sort((x,y)=>x.username.localeCompare(y.username)),[
+      {username:"Alice",listening:false},{username:"Bob",listening:false}
+    ]);
+    a.disconnect(); b.disconnect();
+    playbackEnabled=true;
+    await restart();
+  });
 });
