@@ -11,7 +11,7 @@ export function musicPlayer(socket, emit, notice, icon) {
   let session, flags={}, state, catalog, usage, tab="queue", open=false;
   let commandBusy=false, transfer, loading=false, dragging=false, viewKey="";
   let readVersion=0, refreshTimer;
-  const panel=$("room-music"), seek=$("music-seek"), list=$("music-tracks");
+  const panel=$("room-music"), seek=$("music-seek"), list=$("music-tracks"), progressLine=$("player-progress");
   const audio=roomAudio($("listen-btn"),$("resume-audio"),socket,emit,notice,accept,progress);
 
   function feedback(message) {
@@ -27,6 +27,8 @@ export function musicPlayer(socket, emit, notice, icon) {
     const position=dragging ? Number(seek.value) : audio.position();
     if (!dragging) seek.value=String(Math.round(position));
     seek.setAttribute("aria-valuetext",time(position)+" of "+time(duration));
+    progressLine.max=String(duration || 1);
+    progressLine.value=String(Math.min(position,duration || 1));
     const detail=!session ? "Reconnecting…" : !state ? "Loading player…" :
       state.current_entry ? (audio.status || (state.playing ? "Playing" : "Paused"))+" · "+time(position)+" / "+time(duration) :
       "No track selected";

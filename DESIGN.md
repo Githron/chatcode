@@ -1,17 +1,20 @@
 ---
 name: "ChatCode"
-description: "A charcoal room-based messenger with red actions and a bracketed wordmark."
+description: "A near-black room messenger with HUD hairlines, violet accents, and atmospheric gradients."
 colors:
-  canvas: "#181818"
-  canvas-elev: "#303030"
-  ink: "#ffffff"
-  body: "#969696"
-  muted: "#666666"
-  muted-soft: "#8f8f8f"
-  rosso: "#da291c"
-  rosso-active: "#b01e0a"
-  hairline: "#303030"
-  yellow: "#fff200"
+  canvas: "#090b12"
+  canvas-elev: "#14151f"
+  surface-raised: "#1b1c29"
+  rail: "#0d0f17"
+  ink: "#f4f1ff"
+  body: "#c5c1d6"
+  muted: "#9794aa"
+  violet: "#a78bfa"
+  violet-bright: "#b9a2ff"
+  indigo: "#6b84ff"
+  hairline: "#343245"
+  hairline-soft: "#262436"
+  focus: "#b9c6ff"
 typography:
   display:
     fontFamily: "Inter, -apple-system, system-ui, sans-serif"
@@ -55,8 +58,8 @@ typography:
     fontSize: "10px"
     fontWeight: 400
 rounded:
-  square: "0px"
-  field: "4px"
+  panel: "14px"
+  field: "9px"
   pill: "9999px"
   dot: "50%"
 spacing:
@@ -70,35 +73,35 @@ spacing:
   xxl: "96px"
 components:
   button-connect:
-    backgroundColor: "{colors.rosso}"
+    backgroundColor: "{colors.violet}"
     textColor: "{colors.ink}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     typography: "{typography.action}"
     height: "48px"
     padding: "14px 32px"
     width: "100%"
   button-send:
-    backgroundColor: "{colors.rosso}"
+    backgroundColor: "{colors.violet}"
     textColor: "{colors.ink}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     typography: "{typography.action}"
     height: "48px"
     padding: "14px 32px"
   button-primary-hover:
-    backgroundColor: "{colors.rosso-active}"
+    backgroundColor: "{colors.violet-bright}"
   button-clear:
     textColor: "{colors.body}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     typography: "{typography.label}"
     padding: "6px 12px"
   button-leave:
     textColor: "{colors.body}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     padding: "10px"
   button-image:
     backgroundColor: "{colors.canvas}"
     textColor: "{colors.body}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     size: "48px"
   text-field:
     backgroundColor: "{colors.canvas}"
@@ -108,23 +111,23 @@ components:
     height: "48px"
   room-info:
     backgroundColor: "{colors.canvas-elev}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     padding: "{spacing.xs}"
   member-tag:
-    backgroundColor: "{colors.rosso}"
+    backgroundColor: "{colors.violet}"
     textColor: "{colors.ink}"
     rounded: "{rounded.pill}"
     padding: "2px 8px"
   message-self:
-    backgroundColor: "{colors.rosso}"
+    backgroundColor: "{colors.violet}"
     textColor: "{colors.ink}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     typography: "{typography.body}"
     padding: "10px 14px"
   message-other:
     backgroundColor: "{colors.canvas-elev}"
     textColor: "{colors.ink}"
-    rounded: "{rounded.square}"
+    rounded: "{rounded.panel}"
     typography: "{typography.body}"
     padding: "10px 14px"
 ---
@@ -133,19 +136,20 @@ components:
 
 ## Overview
 
-The join screen centers a bracketed wordmark and two fields against a charcoal backdrop. In the room, the same wordmark moves into the sidebar and the conversation gets the available space. Red connects the room code, the sender’s own messages, and the action that sends the next one.
+The join screen pairs a layered HUD poster with two fields against a near-black backdrop. In the room, the wordmark moves into the sidebar and the conversation gets the available space. Violet connects the room code, the sender’s own messages, and the action that sends the next one.
 
 **Key characteristics**
 
-- A white CHAT and red CODE sit between muted brackets.
-- Square message bubbles distinguish authors by both position and fill.
+- A light CHAT and violet CODE sit beside a gradient mark.
+- Rounded message bubbles distinguish authors by both position and fill.
 - Compact uppercase labels sit beside mixed-case conversation text.
+- Thin corner brackets and a faint grid supply the HUD atmosphere.
 
 ## Colors
 
-Rosso Corsa marks Connect, Send, outgoing messages, the current user, presence indicators, and the rule beside a quoted reply. Hovering or pressing a primary button darkens the red. The same hue carries errors and connection updates, where the text explains the state.
+Violet (`#a78bfa`) marks Connect, Send, the sender’s own messages, the current user, presence, and quoted replies; indigo (`#6b84ff`) shades the second stop of gradients and atmospheric glows. Hovering or pressing a primary button brightens the gradient.
 
-White carries conversation text. Body gray carries instructions, incoming authors, and secondary actions. Muted gray recedes further for timestamps, placeholders, and brackets. Field labels use the lighter muted gray. The raised charcoal fill and the hairline share a value but serve different roles. Yellow is the global keyboard-focus accent. Only the join backdrop has a gray-to-charcoal gradient with a thin red line at the bottom.
+`#f4f1ff` carries conversation text. Body lavender-gray carries instructions, incoming authors, and secondary actions. Muted gray recedes further for timestamps, placeholders, and brackets. Panels sit on the near-black canvas with soft hairlines rather than heavy shadows. Pale blue-violet is the global keyboard-focus accent. The join poster uses a violet-to-indigo radial glow with HUD corner brackets and a masked grid.
 
 ## Typography
 
@@ -161,35 +165,36 @@ At 640px and below, the sidebar becomes a menu-controlled drawer. The header shr
 
 ## Elevation & Depth
 
-Subtle changes in charcoal and 1px separators distinguish the header, member list, incoming messages, and composer. The join content sits directly on the backdrop. The field focus treatment adds a 2px translucent red ring. An expanded image occupies a fixed near-black overlay with the image bounded to 92% of the viewport in each direction.
+Near-black surfaces and 1px hairlines distinguish the header, member list, incoming messages, and composer. Ambient violet and indigo gradients sit behind the join poster and workspace. The field focus treatment adds a soft violet ring and a low-opacity glow. An expanded image occupies a fixed near-black overlay with the image bounded to 92% of the viewport in each direction.
 
 ## Shapes
 
-Primary and secondary buttons, message bubbles, room panels, and image thumbnails have square corners. Text fields and the reply-cancel control use 4px corners. The header username and YOU badge use pill shapes. Presence and typing indicators use circles.
+Primary buttons, message bubbles, room panels, and image thumbnails use 8–14px corners; bubbles keep a tighter corner on the sender’s side. Text fields and the reply control use 9px corners. The header username and YOU badge use pill shapes. Presence and typing indicators use circles.
 
 ## Components
 
 | Component | Appearance and behavior |
 |---|---|
-| Join form | Two labeled fields precede a full-width Connect button. Focusing a field turns its border red. While joining, the button dims and its label reads `SECURING...`. |
-| Room sidebar | A red code and online count lead into a list of members. Each row carries a dot and a name. The current user has a red name and a YOU badge. Leave Room sits at the bottom. |
+| Join form | Two labeled fields precede a full-width Connect button. Focusing a field turns its border violet. While joining, the button dims and its label reads `Joining…`. |
+| Room sidebar | A violet room glyph and online count lead into a list of members. Each row carries an avatar and a name. The current user has a violet avatar and a YOU badge. Leave Room sits at the bottom. |
 | Header actions | The room code takes the flexible space. Clear uses a compact outlined button, and the username sits in an outlined pill. The menu icon appears at the phone breakpoint. |
-| Messages | The author and timestamp sit above the bubble. Outgoing messages align right with the author nearest the right edge. Incoming messages align left. System notices are centered. |
-| Composer | An outlined image button, flexible text field, and solid Send button share one row. Hovering the image button highlights its icon and border. Typing dots animate above the row. |
-| Replies and images | Selecting message text opens a preview above the composer. The quoted content in a sent reply has a 3px red left edge. Image thumbnails open an overlay on selection. |
+| Messages | The author and timestamp sit above the bubble. Outgoing messages align right on a violet-indigo gradient; incoming messages sit on a bordered panel. System notices are centered. |
+| Composer | An outlined image button, flexible text field, and gradient Send button share one row. Hovering the image button highlights its icon and border. Typing dots animate above the row. |
+| Replies and images | Selecting message text opens a preview above the composer. The quoted content in a sent reply has a 2px violet left edge. Image thumbnails open an overlay on selection. |
 
-New messages rise 8px and fade in over 200ms. The reply preview rises 6px over 150ms. The reduced-motion rule shortens CSS animation and transition durations to 0.01ms.
+New messages rise 4px and fade in over 170ms. The reduced-motion rule shortens CSS animation and transition durations to 0.01ms.
 
 ## Do's and Don'ts
 
 **Do**
 
-- Pair outgoing red with right alignment and incoming charcoal with left alignment.
+- Pair the outgoing gradient with right alignment and incoming panels with left alignment.
 - Keep author names and timestamps outside the message bubble.
 - Use the sidebar for room membership and keep message entry in the bottom bar.
+- Keep HUD lines and glows at low opacity so text stays dominant.
 
 **Don't**
 
 - Avoid pill-shaped message bubbles and primary buttons.
-- Avoid decorative shadows on panels or messages.
-- Reserve yellow for keyboard focus.
+- Avoid saturated neon, stacked shadows, or decorative panels that compete with messages.
+- Reserve the pale focus ring for keyboard focus.
