@@ -187,6 +187,8 @@ export function attachmentRoutes(app, sessions, storage, music=storage.music, al
     const generation = req.fileGeneration;
     let plaintext;
     let key;
+    let responseData;
+    let responseStatus;
     try {
       const name = req.fileName;
       const ext = name.split(".").pop().toLowerCase();
@@ -202,31 +204,54 @@ export function attachmentRoutes(app, sessions, storage, music=storage.music, al
         const hex=createHmac("sha256",key).update("chatcode-mp3-v1\0").update(name).update("\0").update(plaintext).digest("hex");
         const id=[hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20,32)].join("-");
         plaintext.fill(0); key.fill(0);
-        if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
-        try {
-          const created=await music.saveUpload(peer.room,id,{filename:name,sizeBytes,durationMs},bytes,stillJoined);
-          if (created) trackPublished(peer.room);
-          if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
-          return res.status(created?201:200).json({id,name,type:"audio/mpeg",size:sizeBytes,durationMs});
-        } catch (err) {
-          if (!stillJoined()) return res.status(401).json({error:"Join the room again to upload music."});
-          return res.status(err.publicMessage?507:503).json({error:err.publicMessage || "Music storage is unavailable. Retry the upload."});
+        if (!stillJoined()) {
+          responseStatus = 401;
+          responseData = {error:"Join the room again to upload music."};
+        } else {
+          try {
+            const created=await music.saveUpload(peer.room,id,{filename:name,sizeBytes,durationMs},bytes,stillJoined);
+            if (created) trackPublished(peer.room);
+            if (!stillJoined()) {
+              responseStatus = 401;
+              responseData = {error:"Join the room again to upload music."};
+            } else {
+              responseStatus = created ? 201 : 200;
+              responseData = {id,name,type:"audio/mpeg",size:sizeBytes,durationMs};
+            }
+          } catch (err) {
+            if (!stillJoined()) {
+              responseStatus = 401;
+              responseData = {error:"Join the room again to upload music."};
+            } else {
+              responseStatus = err.publicMessage ? 507 : 503;
+              responseData = {error:err.publicMessage || "Music storage is unavailable. Retry the upload."};
+            }
+          }
+        }
+      } else {
+        const dimensions=await validate(plaintext, ext);
+        if (req.destroyed && !req.complete || res.destroyed || sessions.get(peer.token) !== peer || peer.state.generation !== generation) {
+          responseStatus = 409;
+          responseData = { error: "The room changed. Choose the file again." };
+        } else if (!hasSpace(peer.room, bytes.length)) {
+          responseStatus = 429;
+          responseData = { error: "Room file storage is full." };
+        } else {
+          const id = randomUUID();
+          const info = { id, name, type: allowed[ext], size: plaintext.length, ...dimensions };
+          files.set(id, { info, bytes, owner: peer.token, address:req.uploadAddress, room: peer.room, published: false, expires: Date.now() + 120_000 });
+          responseStatus = 201;
+          responseData = info;
         }
       }
-      const dimensions=await validate(plaintext, ext);
-      if (req.destroyed && !req.complete || res.destroyed || sessions.get(peer.token) !== peer || peer.state.generation !== generation)
-        return res.status(409).json({ error: "The room changed. Choose the file again." });
-      if (!hasSpace(peer.room, bytes.length)) return res.status(429).json({ error: "Room file storage is full." });
-      const id = randomUUID();
-      const info = { id, name, type: allowed[ext], size: plaintext.length, ...dimensions };
-      files.set(id, { info, bytes, owner: peer.token, address:req.uploadAddress, room: peer.room, published: false, expires: Date.now() + 120_000 });
-      res.status(201).json(info);
     } catch {
-      res.status(415).json({ error: "File validation failed. Check that the file is complete and matches its extension." });
+      responseStatus = 415;
+      responseData = { error: "File validation failed. Check that the file is complete and matches its extension." };
     } finally {
       plaintext?.fill(0); key?.fill(0);
-      req.finishUpload();
+      await req.finishUpload();
     }
+    res.status(responseStatus).json(responseData);
   });
 
   app.get("/api/files/:id", async (req, res) => {
