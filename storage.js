@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import pg from "pg";
-import { mediaStorage, MediaConfigurationError } from "./media-storage.js";
+import { mediaStorage } from "./media-storage.js";
+import { quotaMigration, storageQuota } from "./storage-quota.js";
 import { storageStep } from "./storage-diagnostics.js";
 import { musicMigration, musicStorage } from "./music-storage.js";
 
@@ -10,7 +11,6 @@ function query(db, operation, sql, params) {
   return storageStep("postgres." + operation, () => db.query(sql, params));
 }
 
-const MiB = 1024 * 1024;
 function expiredReservation() {
   const error = new Error("Attachment expired. Please retry the upload.");
   error.publicMessage = error.message;
@@ -37,6 +37,7 @@ const sql = `
   );
   ALTER TABLE chatcode_object_cleanup ADD COLUMN IF NOT EXISTS byte_count integer;
   ALTER TABLE chatcode_object_cleanup ADD COLUMN IF NOT EXISTS room text;
+  CREATE INDEX IF NOT EXISTS chatcode_object_cleanup_due ON chatcode_object_cleanup(due);
   CREATE TABLE IF NOT EXISTS chatcode_storage_lock (id integer PRIMARY KEY);
   INSERT INTO chatcode_storage_lock VALUES (1) ON CONFLICT DO NOTHING;
 `;
@@ -53,7 +54,8 @@ async function database() {
         const client=await pool.connect();
         let discard;
         try {
-          await client.query("BEGIN");
+          // Budget decisions must see the transaction that just released the mutex.
+          await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
           const result=await fn(client);
           await client.query("COMMIT");
           return result;
@@ -78,39 +80,27 @@ async function database() {
 
 export async function openStorage({enableMusicStorage = false} = {}) {
   const media = mediaStorage();
-  const configured = process.env.CHATCODE_STORAGE_BUDGET_BYTES ?? String(128 * MiB);
-  const budget = Number(configured);
-  if (!/^\d+$/.test(configured) || !Number.isSafeInteger(budget))
-    throw new MediaConfigurationError("CHATCODE_STORAGE_BUDGET_BYTES must be a nonnegative integer.");
   const db = await database();
-  await db.exec(sql);
   const lockBudget = tx => query(tx,"lock_budget","SELECT id FROM chatcode_storage_lock WHERE id=1 FOR UPDATE");
-  await db.transaction(async tx => {
-    await lockBudget(tx);
-    for (const statement of musicMigration) await tx.query(statement);
-  });
-  async function budgetUsage(tx, room, localOnly=false) {
-    const {rows} = await query(tx,"check_budget",`SELECT sum(byte_count) AS total,
-      sum(byte_count) FILTER (WHERE room=$1) AS local FROM (
-        SELECT byte_count, room FROM chatcode_messages WHERE byte_count>0
-        UNION ALL SELECT byte_count, room FROM chatcode_music_tracks
-        UNION ALL SELECT byte_count, room FROM chatcode_object_cleanup
-      ) usage ${localOnly ? "WHERE room=$1" : ""}`, [room]);
-    return {total:Number(rows[0].total),used:Number(rows[0].local),limit:40 * MiB};
+  let quota;
+  try {
+    quota=storageQuota(db,media,lockBudget);
+    await db.exec(sql);
+    await db.transaction(async tx => {
+      await lockBudget(tx);
+      for (const statement of musicMigration) await tx.query(statement);
+      for (const statement of quotaMigration.split(";").filter(s=>s.trim())) await tx.query(statement);
+    });
+  } catch (error) {
+    await db.close();
+    throw error;
   }
-  async function checkSpace(tx, room, size) {
-    const {total,used,limit}=await budgetUsage(tx,room);
-    if (total + size > budget || used + size > limit) {
-      const error = new Error("Attachment storage is full. You can still send text.");
-      error.publicMessage = error.message;
-      throw error;
-    }
-  }
-  async function collectKeys(tx, rows) {
+  const {checkSpace}=quota;
+  async function collectKeys(tx, rows, kind="attachment") {
     const objects = rows.filter(row => row.object_key);
-    if (objects.length) await query(tx,"queue_cleanup",`INSERT INTO chatcode_object_cleanup(object_key, byte_count, room)
-      SELECT * FROM unnest($1::text[], $2::integer[], $3::text[]) ON CONFLICT DO NOTHING`,
-      [objects.map(r=>r.object_key), objects.map(r=>r.byte_count), objects.map(r=>r.room)]);
+    if (objects.length) await query(tx,"queue_cleanup",`INSERT INTO chatcode_object_cleanup(object_key, byte_count, room, kind, deleting)
+      SELECT *, $4, true FROM unnest($1::text[], $2::integer[], $3::text[]) ON CONFLICT DO NOTHING`,
+      [objects.map(r=>r.object_key), objects.map(r=>r.byte_count), objects.map(r=>r.room),kind]);
   }
   async function trim(tx,room) {
     const deleted=await query(tx,"prune_history",`DELETE FROM chatcode_messages WHERE room=$1 AND seq IN
@@ -121,16 +111,25 @@ export async function openStorage({enableMusicStorage = false} = {}) {
   async function cleanObjects() {
     try {
       // Compete with publication for the reservation row before deleting its object.
-      await db.query(`UPDATE chatcode_object_cleanup SET music_upload_id=NULL
-        WHERE music_upload_id IS NOT NULL AND due<=clock_timestamp()`);
-      const {rows}=await db.query(`SELECT object_key FROM chatcode_object_cleanup
-        WHERE music_upload_id IS NULL AND due <= now() ORDER BY due LIMIT 50`);
+      const {rows}=await query(db,"cleanup_claim",`UPDATE chatcode_object_cleanup SET deleting=true,music_upload_id=NULL,
+        uploading_until=NULL,due=clock_timestamp()+interval '5 minutes'
+        WHERE object_key IN (SELECT object_key FROM chatcode_object_cleanup
+          WHERE due<=clock_timestamp()
+            AND (uploading_until IS NULL OR uploading_until<=clock_timestamp())
+          ORDER BY due LIMIT 50 FOR UPDATE SKIP LOCKED) RETURNING object_key`);
       for(const {object_key} of rows) {
         try {
           await media.remove(object_key);
-          await db.query("DELETE FROM chatcode_object_cleanup WHERE object_key=$1",[object_key]);
+          await storageStep("postgres.cleanup_commit",()=>db.transaction(async tx=>{
+            // A scan that already listed this key must finish before its charge disappears.
+            await tx.query("SELECT id FROM chatcode_storage_lock WHERE id=3 FOR UPDATE");
+            await lockBudget(tx);
+            await tx.query("DELETE FROM chatcode_r2_discrepancies WHERE object_key=$1",[object_key]);
+            await tx.query("DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND deleting",[object_key]);
+          }));
         } catch {
-          await db.query("UPDATE chatcode_object_cleanup SET due=now()+interval '5 minutes' WHERE object_key=$1",[object_key]);
+          await query(db,"cleanup_defer",`UPDATE chatcode_object_cleanup SET due=now()+interval '5 minutes'
+            WHERE object_key=$1`,[object_key]);
         }
       }
     } catch {console.error("Attachment cleanup deferred.");}
@@ -139,21 +138,54 @@ export async function openStorage({enableMusicStorage = false} = {}) {
     cleaning ??= cleanObjects().finally(()=>{cleaning=undefined;});
     return cleaning;
   }
-  const interval=setInterval(cleanup,60000).unref();
+  let inventory=quota.refresh();
+  const interval=setInterval(()=>{inventory=quota.refresh(); void cleanup();},60000).unref();
   void cleanup();
 
+  // Mark the reservation as in flight in a short transaction, then write without holding a
+  // database connection. Cleanup ignores rows whose upload lease is still active.
+  async function writeReserved(key, bytes, once=false) {
+    const state=await storageStep("postgres.upload_lease",()=>db.transaction(async tx=>{
+      const held=await tx.query(`SELECT byte_count,deleting,due>clock_timestamp() AS active
+        FROM chatcode_object_cleanup WHERE object_key=$1 FOR UPDATE`,[key]);
+      if (!held.rows.length) return once ? "published" : "expired";
+      const row=held.rows[0];
+      if (row.deleting || !row.active) return "expired";
+      if (row.byte_count!==bytes.length) return "expired";
+      await tx.query(`UPDATE chatcode_object_cleanup
+        SET uploading_until=clock_timestamp()+interval '10 minutes',
+            due=clock_timestamp()+interval '10 minutes'
+        WHERE object_key=$1`,[key]);
+      return "reserved";
+    }));
+    if (state==="published") return; // A concurrent retry already published this create-only object.
+    if (state==="expired") throw expiredReservation();
+    if (once) await media.putOnce(key,bytes);
+    else await media.put(key,bytes);
+  }
+  async function retrySoon(key, force=false) {
+    // An ambiguous PUT/commit can be retried briefly. Cleanup still requires a confirmed DELETE.
+    // If force=true (called from error handler), clear uploading_until to expedite cleanup.
+    // Otherwise, respect the upload lease to avoid deleting an object still being written.
+    const clause = force
+      ? "NOT deleting"
+      : "NOT deleting AND (uploading_until IS NULL OR uploading_until<=clock_timestamp())";
+    await query(db,"retry_soon",`UPDATE chatcode_object_cleanup
+      SET due=least(due,clock_timestamp()+interval '2 minutes'),
+          uploading_until=CASE WHEN $2 THEN NULL ELSE uploading_until END
+      WHERE object_key=$1 AND ${clause}`,[key,force]).catch(()=>console.error("Upload cleanup deferred."));
+  }
   return {
-    music: enableMusicStorage ? musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget}) : undefined,
+    music: enableMusicStorage ? musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget,
+      writeReserved, retrySoon, ready:quota.ready}) : undefined,
+    report:quota.report, beginUpload:quota.beginUpload, endUpload:quota.endUpload,
     async close() {
       clearInterval(interval);
-      await cleaning;
+      await Promise.all([cleaning,inventory]);
       await db.close();
     },
-    async roomUsage(code) {
-      const {used,limit}=await budgetUsage(db,roomId(code),true);
-      return {used,limit};
-    },
-    checkUploadSpace: (code, size) => checkSpace(db, roomId(code), size),
+    roomUsage: code=>quota.roomUsage(roomId(code)),
+    async checkUploadSpace(code,size) {await quota.ready(); await checkSpace(db,roomId(code),size);},
     async history(code) {
       const {rows}=await db.query("SELECT payload FROM chatcode_messages WHERE room=$1 ORDER BY seq",[roomId(code)]);
       return rows.map(r=>r.payload);
@@ -166,28 +198,30 @@ export async function openStorage({enableMusicStorage = false} = {}) {
     async save(code,event,clientId,file) {
       const room=roomId(code);
       const objectKey=file ? file.objectKey || media.newKey() : null;
+      if (file) await quota.ready();
       if(objectKey){
         // The reservation survives a crash between PUT and the message commit.
         await storageStep("postgres.reserve_transaction",()=>db.transaction(async tx=>{
           await lockBudget(tx);
           if(file.objectKey){
             // A lost commit acknowledgement must never queue a published object for deletion.
-            const reserved=await query(tx,"find_reservation","SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now()",[objectKey]);
+            const reserved=await query(tx,"find_reservation","SELECT 1 FROM chatcode_object_cleanup WHERE object_key=$1 AND NOT deleting AND due>clock_timestamp()",[objectKey]);
             if(!reserved.rows.length)throw expiredReservation();
             return;
           }
           await checkSpace(tx,room,file.bytes.length);
-          await query(tx,"insert_reservation",`INSERT INTO chatcode_object_cleanup(object_key,due,byte_count,room)
-            VALUES($1,now()+interval '1 hour',$2,$3)`,[objectKey,file.bytes.length,room]);
+          await query(tx,"insert_reservation",`INSERT INTO chatcode_object_cleanup(object_key,due,byte_count,room,kind)
+            VALUES($1,now()+interval '1 hour',$2,$3,'attachment')`,[objectKey,file.bytes.length,room]);
         }));
         file.objectKey=objectKey;
-        await media.put(objectKey,file.bytes);
+        try {await writeReserved(objectKey,file.bytes);}
+        catch (error) {await retrySoon(objectKey,true); throw error;}
       }
       await storageStep("postgres.publish_transaction",()=>db.transaction(async tx=>{
         // Serialize retention and storage-budget decisions in the same transaction.
         await lockBudget(tx);
         if(objectKey){
-          const claimed=await query(tx,"claim_reservation","DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND due>now() RETURNING object_key",[objectKey]);
+          const claimed=await query(tx,"claim_reservation","DELETE FROM chatcode_object_cleanup WHERE object_key=$1 AND NOT deleting AND due>clock_timestamp() RETURNING object_key",[objectKey]);
           if(!claimed.rows.length)throw expiredReservation();
         }
         if(file && !objectKey)await checkSpace(tx,room,file.bytes.length);
@@ -197,7 +231,7 @@ export async function openStorage({enableMusicStorage = false} = {}) {
           room,event.id,clientId||null,JSON.stringify(event),file?.info.id||null,
           file?.bytes.length||0,file&&!objectKey?file.bytes:null,objectKey]);
         await trim(tx,room);
-      }));
+      })).catch(async error=>{if (objectKey) await retrySoon(objectKey,true); throw error;});
     },
     async readFile(code,id) {
       const {rows}=await db.query("SELECT ciphertext,object_key FROM chatcode_messages WHERE room=$1 AND attachment_id=$2",[roomId(code),id]);

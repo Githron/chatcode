@@ -98,7 +98,7 @@ async function applyPlayback(tx, room, {action,argument}, state) {
 }
 
 // Room codes come from the authorized peer. Reservation handles never leave the server.
-export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget}) {
+export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBudget, writeReserved, retrySoon, ready}) {
   async function lockedRevision(tx, room) {
     const {rows} = await tx.query("SELECT revision::text FROM chatcode_music_playback WHERE room=$1 FOR UPDATE", [room]);
     return rows[0]?.revision;
@@ -131,7 +131,7 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
     const removed = await tx.query(`DELETE FROM chatcode_music_tracks WHERE room=$1 AND track_id=$2
       RETURNING room, object_key, byte_count`, [room, trackId]);
     if (!removed.rows.length) throw new Error("Music track unavailable.");
-    await collectKeys(tx, removed.rows);
+    await collectKeys(tx, removed.rows,"music");
   }
 
   async function commitCommand(code, input, stillJoined, playback) {
@@ -190,6 +190,7 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
       const objectKey = media.newKey();
       if (!objectKey?.startsWith("chatcode/r2/")) throw new Error("Music requires private R2 storage.");
       const room = roomId(code), bytes = size + envelopeBytes;
+      await ready();
       return db.transaction(async tx => {
         await lockBudget(tx);
         const existing=await tx.query("SELECT 1 FROM chatcode_music_tracks WHERE room=$1 AND track_id=$2", [room,trackId]);
@@ -199,9 +200,9 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
         if (prior.rows.length) return {trackId, objectKey:prior.rows[0].object_key};
         await tx.query(`UPDATE chatcode_object_cleanup SET music_upload_id=NULL
           WHERE room=$1 AND music_upload_id=$2 AND due<=clock_timestamp()`,[room,trackId]);
-        await checkSpace(tx, room, bytes);
-        await tx.query(`INSERT INTO chatcode_object_cleanup(object_key, room, byte_count, music_upload_id, due)
-          VALUES ($1,$2,$3,$4,clock_timestamp()+interval '1 hour')`, [objectKey, room, bytes, trackId]);
+        await checkSpace(tx, room, bytes,"music");
+        await tx.query(`INSERT INTO chatcode_object_cleanup(object_key, room, byte_count, music_upload_id, kind, due)
+          VALUES ($1,$2,$3,$4,'music',clock_timestamp()+interval '1 hour')`, [objectKey, room, bytes, trackId]);
         return {trackId, objectKey};
       });
     },
@@ -240,10 +241,15 @@ export function musicStorage({db, media, roomId, checkSpace, collectKeys, lockBu
     async saveUpload(code, id, metadata, encrypted, stillJoined) {
       if (encrypted.length!==metadata.sizeBytes+envelopeBytes) throw new Error("Invalid track envelope size.");
       const reservation=await this.reserveTrack(code,metadata.sizeBytes,id);
-      if (!stillJoined()) throw new Error("Room session ended.");
-      if (reservation.published) return false;
-      await media.putOnce(reservation.objectKey,encrypted);
-      await this.publishTrack(code,id,metadata,reservation.objectKey,stillJoined);
+      try {
+        if (!stillJoined()) throw new Error("Room session ended.");
+        if (reservation.published) return false;
+        await writeReserved(reservation.objectKey,encrypted,true);
+        await this.publishTrack(code,id,metadata,reservation.objectKey,stillJoined);
+      } catch (error) {
+        if (reservation.objectKey) await retrySoon(reservation.objectKey);
+        throw error;
+      }
       return true;
     },
 

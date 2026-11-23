@@ -118,11 +118,13 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
   await mkdir(objects);
   const account="a".repeat(32);
   let backend="database",budget=128*1024*1024,pgOptions="",musicEnabled=false,queueEnabled=false,playbackEnabled=false;
+  let ipRate=120, adminToken=randomUUID(), trustedProxies="";
   let stderr="";
   const start=(port=0)=>{
     const child=spawn(process.execPath,["--import","./test/mock-object-store.mjs","server.js"],{
     cwd:new URL("./",import.meta.url),env:{...process.env,DATABASE_URL:process.env.CHATCODE_TEST_DATABASE_URL||"",
       PGHOST:"",PGOPTIONS:pgOptions,RENDER:"",NODE_ENV:"test",CHATCODE_MEDIA_BACKEND:"database",CHATCODE_STORAGE_BUDGET_BYTES:String(budget),
+      CHATCODE_UPLOADS_PER_IP_MINUTE:String(ipRate),CHATCODE_STORAGE_ADMIN_TOKEN:adminToken,CHATCODE_TRUSTED_PROXIES:trustedProxies,
       S3_BUCKET:backend==="database"?"":"test-legacy",S3_ENDPOINT:"https://legacy.invalid",AWS_REGION:"us-east-1",
       AWS_ACCESS_KEY_ID:"legacy-test",AWS_SECRET_ACCESS_KEY:"fixture",AWS_SESSION_TOKEN:"",
       R2_ACCOUNT_ID:backend==="r2"?account:"",R2_ENDPOINT:backend==="r2"?"https://"+account+".r2.cloudflarestorage.com":"",
@@ -184,6 +186,16 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
   assert.ok(a.ok&&b.ok&&outsider.ok);
   const key=await roomKey(room);
   const auth=token=>({Authorization:"Bearer "+token});
+  await t.test("only the admin bearer can read the private usage report",async()=>{
+    const report=token=>fetch(url+"/api/admin/storage",{headers:auth(token)});
+    for (const token of ["",a.token,"invalid"]) assert.equal((await report(token)).status,403);
+    const response=await report(adminToken);
+    assert.equal(response.status,200);
+    assert.equal(response.headers.get("cache-control"),"no-store");
+    const data=await response.json();
+    assert.deepEqual(data.global,{used:0,limit:budget,remaining:budget,warning:null});
+    assert.deepEqual(data.rooms,[]);
+  });
   async function upload(name,data,token=a.token){
     return fetch(url+"/api/files",{method:"POST",headers:{...auth(token),"Content-Type":"application/octet-stream","X-File-Name":encodeURIComponent(name)},body:await seal(key,data)});
   }
@@ -747,4 +759,22 @@ test("two-client room and private attachment transfers", {timeout:process.env.CH
     }
   });
 
+  await t.test("IP upload limits persist across restart and newly joined rooms",async()=>{
+    ipRate=1;
+    trustedProxies="loopback";
+    adminToken="";
+    await restart();
+    async function postFromNewRoom(forwarded) {
+      const code="rate-"+randomUUID().slice(0,8), member=await join(await connect(),"Writer",code);
+      return fetch(url+"/api/files",{method:"POST",body:await seal(await roomKey(code),Buffer.from("sample")),
+        headers:{...auth(member.token),"X-Forwarded-For":forwarded+", 192.0.2.8","Content-Type":"application/octet-stream",
+          "X-File-Name":"a.txt"}});
+    }
+    assert.equal((await postFromNewRoom("192.0.2.1")).status,201);
+    await restart();
+    const blocked=await postFromNewRoom("192.0.2.2");
+    assert.equal(blocked.status,429);
+    assert.equal(blocked.headers.get("retry-after"),"60");
+    assert.equal((await fetch(url+"/api/admin/storage")).status,403);
+  });
 });

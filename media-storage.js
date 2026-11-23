@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { storageStep } from "./storage-diagnostics.js";
 
 export class MediaConfigurationError extends Error {}
@@ -47,6 +47,23 @@ export function mediaStorage(env = process.env) {
     });
   }
   return {
+    hasR2: !!r2,
+    async *inventory() {
+      let token;
+      do {
+        const page = await storageStep("r2.ListObjectsV2", () => r2.send(new ListObjectsV2Command({
+          Bucket: r2Bucket, Prefix: "chatcode/r2/", ContinuationToken: token,
+        }), {abortSignal: AbortSignal.timeout(15000)}));
+        const entries = page.Contents || [];
+        if (typeof page.IsTruncated!=="boolean" ||
+            entries.some(({Key, Size}) => !Key?.startsWith("chatcode/r2/") || !Number.isSafeInteger(Size) || Size < 0))
+          throw new Error("Invalid storage inventory.");
+        yield entries;
+        if (page.IsTruncated && (!page.NextContinuationToken || page.NextContinuationToken === token))
+          throw new Error("Incomplete storage inventory.");
+        token = page.IsTruncated && page.NextContinuationToken;
+      } while (token);
+    },
     newKey: () => r2 ? "chatcode/r2/" + randomUUID() : legacy ? "chatcode/" + randomUUID() : null,
     put: (key, bytes) => send(key, PutObjectCommand, { Body: bytes, ContentType: "application/octet-stream" }, 45000),
     putOnce: (key, bytes) => send(key, PutObjectCommand, { Body: bytes, ContentType: "application/octet-stream", IfNoneMatch:"*" }, 45000),

@@ -1,6 +1,7 @@
 import express from "express";
 import { randomUUID, pbkdf2, createDecipheriv, createHmac } from "node:crypto";
 import { promisify } from "node:util";
+import { isIP } from "node:net";
 import yauzl from "yauzl";
 import { imageSize } from "image-size";
 import { fileLimit, uploadLimit } from "./public/transfer.js";
@@ -120,7 +121,6 @@ export function stagedFile(id, peer) {
 export function releaseFile(id) { files.delete(id); }
 
 export function attachmentRoutes(app, sessions, storage, music=storage.music, allowMusicUploads=!!music, trackPublished=()=>{}) {
-  let recentUploads = [];
   const musicPath="/api/music/tracks";
   const uploadPaths=allowMusicUploads ? ["/api/files",musicPath] : ["/api/files"];
   if (music) app.use(musicPath,(req,res,next)=>{req.musicUpload=true; next();});
@@ -143,19 +143,42 @@ export function attachmentRoutes(app, sessions, storage, music=storage.music, al
       return res.status(415).json({error:"Choose a supported file with a safe filename."});
     if (!Number.isSafeInteger(size) || size <= 28 || size > uploadLimit(name)+28 || !req.is("application/octet-stream") || req.get("Content-Encoding"))
       return res.status(413).json({ error: "Choose a nonempty image up to 8 MB or another supported file up to 10 MiB." });
-    if (inflight.has(token) || inflight.size >= 4 || !hasSpace(room, size)) return res.status(429).json({ error: "File storage is busy or full. Try again later." });
-    const now = Date.now();
-    recentUploads = recentUploads.filter(entry => now-entry.time < 60_000);
-    if (recentUploads.length >= 120 || recentUploads.filter(entry => entry.token === token).length >= 12)
-      return res.set("Retry-After","60").status(429).json({error:"Too many uploads. Try again in a minute."});
-    recentUploads.push({time:now,token});
+    if (inflight.has(token) || inflight.size >= 4 || (!req.musicUpload && !hasSpace(room, size)))
+      return res.set("Retry-After","60").status(429).json({ error: "File storage is busy or full. Try again later." });
+    let lease, releasing;
+    const timer=setTimeout(()=>req.destroy(),120000).unref();
+    function finish() {
+      clearTimeout(timer);
+      if (inflight.get(token)===req) inflight.delete(token);
+      if (!lease) return releasing || Promise.resolve();
+      const id=lease;
+      lease=null;
+      releasing=storage.endUpload(id).catch(()=>console.error("Upload slot release deferred."));
+      return releasing;
+    }
     req.fileName = name;
     req.fileGeneration = req.peer.state.generation;
     inflight.set(token,req);
-    res.once("close", () => {if (!req.checkingFile && inflight.get(token)===req) inflight.delete(token);});
+    req.finishUpload=finish;
+    res.once("close", () => {if (!req.checkingFile) void finish();});
     // A published music retry can succeed at a full quota; reserve after deriving its identity.
-    try { if (!req.musicUpload) await storage.checkUploadSpace(room,size); }
-    catch (err) { return res.status(err.publicMessage ? 507 : 503).json({error:err.publicMessage || "Storage is unavailable. Please retry."}); }
+    try {
+      const ip=(req.ip || "").split("%")[0];
+      const family=isIP(ip);
+      const ipv6=family===4 ? "::ffff:"+ip : ip;
+      req.uploadAddress=family ? new URL("http://["+ipv6+"]").hostname : "unknown";
+      lease=await storage.beginUpload(token,req.uploadAddress);
+      if (res.destroyed) return finish();
+      if (!lease) {
+        await finish();
+        return res.set("Retry-After","60").status(429).json({error:"Too many uploads. Try again in a minute."});
+      }
+      if (!req.musicUpload) await storage.checkUploadSpace(room,size);
+    }
+    catch (err) {
+      await finish();
+      return res.status(err.publicMessage ? 507 : 503).json({error:err.publicMessage || "Storage is unavailable. Please retry."});
+    }
     next();
   }, express.raw({ type: "application/octet-stream", limit: envelopeLimit, inflate: false }), async (req, res) => {
     const peer = req.peer;
@@ -196,13 +219,13 @@ export function attachmentRoutes(app, sessions, storage, music=storage.music, al
       if (!hasSpace(peer.room, bytes.length)) return res.status(429).json({ error: "Room file storage is full." });
       const id = randomUUID();
       const info = { id, name, type: allowed[ext], size: plaintext.length, ...dimensions };
-      files.set(id, { info, bytes, owner: peer.token, room: peer.room, published: false, expires: Date.now() + 120_000 });
+      files.set(id, { info, bytes, owner: peer.token, address:req.uploadAddress, room: peer.room, published: false, expires: Date.now() + 120_000 });
       res.status(201).json(info);
     } catch {
       res.status(415).json({ error: "File validation failed. Check that the file is complete and matches its extension." });
     } finally {
       plaintext?.fill(0); key?.fill(0);
-      if (inflight.get(peer.token)===req) inflight.delete(peer.token);
+      req.finishUpload();
     }
   });
 

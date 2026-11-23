@@ -86,7 +86,7 @@ export function musicPlayer(socket, emit, notice, icon) {
     $("more-tracks").disabled=loading || !session;
     $("music-upload").hidden=$("music-limit").hidden=!flags.musicUploads;
     $("music-upload").disabled=!session || !!transfer;
-    $("music-usage").textContent=usage ? sizeLabel(usage.used)+" of "+sizeLabel(usage.limit)+" room storage used" : loading ? "Checking room storage…" : "Room storage unavailable";
+    $("music-usage").textContent=usage ? sizeLabel(usage.used)+" of "+(usage.limit/1024**3)+" GiB room music storage used" : loading ? "Checking music storage…" : "Music storage unavailable";
     $("music-meter").hidden=!usage;
     if (usage) { $("music-meter").max=usage.limit; $("music-meter").value=usage.used; }
     $("music-collection").setAttribute("aria-busy",String(loading));

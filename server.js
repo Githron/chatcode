@@ -1,6 +1,6 @@
 import express from "express";
 import { createServer } from "node:http";
-import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { randomBytes, randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Server } from "socket.io";
 import { attachmentRoutes, clearFiles, stagedFile, releaseFile } from "./attachments.js";
@@ -19,6 +19,16 @@ try {
 catch (err) {console.error(err instanceof MediaConfigurationError ? err.message : "History storage could not start. Check the database configuration and permissions.");process.exit(1);}
 const app = express();
 app.disable("x-powered-by");
+if (process.env.CHATCODE_TRUSTED_PROXIES) app.set("trust proxy",process.env.CHATCODE_TRUSTED_PROXIES.split(",").map(value=>value.trim()));
+const adminToken=process.env.CHATCODE_STORAGE_ADMIN_TOKEN;
+const digest=value=>createHash("sha256").update(value).digest();
+app.get("/api/admin/storage",async (req,res)=>{
+  res.set("Cache-Control","no-store");
+  if (!adminToken || !timingSafeEqual(digest(req.get("Authorization") || ""),digest("Bearer "+adminToken)))
+    return res.status(403).json({error:"Administrator access required."});
+  try {res.json(await storage.report());}
+  catch {res.status(503).json({error:"Storage reporting unavailable."});}
+});
 const server = createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 24 * 1024 });
 const rooms = new Map();
@@ -203,7 +213,14 @@ io.on("connection", socket => {
     const safeReply = reply ? {id:uuid(reply.id)?reply.id:null,username:reply.username.slice(0,20),message:reply.message,isImage:!!reply.isImage} : null;
     peer.recent.push(now);
     const event={id,username:peer.username,authorId:peer.authorId,sentAt:now,message:message||"",reply:safeReply,attachment:file?.info || null};
-    await storage.save(peer.room,event,clientId,file);
+    let lease;
+    if (file) {
+      lease=await storage.beginUpload(peer.token,file.address,!!file.attempted);
+      if (!lease) return {ok:false,error:"Too many uploads. Try again in a minute."};
+      file.attempted=true;
+    }
+    try {await storage.save(peer.room,event,clientId,file);}
+    finally {if (lease) await storage.endUpload(lease).catch(()=>console.error("Upload slot release deferred."));}
     if(file)releaseFile(attachmentId);
     io.to(channel(peer.room)).emit("receive_message",{...event,senderId:socket.id});
     return {ok:true,id};

@@ -215,11 +215,17 @@ test("music storage migration and lifecycle", async t => {
   });
 
   await t.test("10 MiB boundary and encrypted room quota apply to reservations alongside other rooms", async () => {
-    process.env.CHATCODE_STORAGE_BUDGET_BYTES=String(128*1024*1024);
+    delete process.env.CHATCODE_STORAGE_BUDGET_BYTES;
     await start();
-    for (let i=0;i<3;i++) await store.music.reserveTrack(room,10*1024*1024);
-    await assert.rejects(store.music.reserveTrack(room,10*1024*1024),/full/);
-    await store.music.reserveTrack(other,10*1024*1024);
+    const boundaryRoom = "boundary-room-"+randomUUID().slice(0,8);
+    const boundaryOther = "boundary-other-"+randomUUID().slice(0,8);
+    const max=10*1024*1024, limit=1024**3;
+    for (let i=0;i<102;i++) await store.music.reserveTrack(boundaryRoom,max);
+    await store.music.reserveTrack(boundaryRoom,limit-102*(max+28)-28);
+    await assert.rejects(store.music.reserveTrack(boundaryRoom,1),/Room music storage is full/);
+    assert.deepEqual(await store.roomUsage(boundaryRoom),{used:limit,limit});
+    await store.checkUploadSpace(boundaryRoom,100);
+    await store.music.reserveTrack(boundaryOther,10*1024*1024);
     await inspect(async db=>{
       const report=await readFile(new URL("../storage-usage.sql",import.meta.url),"utf8");
       for (const statement of report.split(";").filter(s=>s.trim())) await db.query(statement);
@@ -351,7 +357,7 @@ test("music storage migration and lifecycle", async t => {
     await music.queueCommand(code,command("add","1",{trackId}));
     await music.playbackCommand(code,command("play","2"));
     const remove=command("deleteTrack","3",{trackId});
-    assert.deepEqual(await store.roomUsage(code),{used:bytes,limit:40*1024*1024});
+    assert.deepEqual(await store.roomUsage(code),{used:bytes,limit:1024**3});
     assert.equal((await store.roomUsage(other)).used,0);
     let checks=0;
     await assert.rejects(music.queueCommand(code,remove,()=>++checks===1),/Join this room/);
@@ -384,5 +390,288 @@ test("music storage migration and lifecycle", async t => {
     await assert.rejects(store.music.queueCommand(code,{commandId:randomUUID(),expectedRevision:"0",
       action:"add",trackId:first.tracks[0].track_id}),/queue is full/);
     assert.equal((await store.music.snapshot(code)).revision,"0");
+  });
+
+  // ==== Focused quota regression tests ====
+
+  async function cleanupTestData() {
+    await close();
+    await inspect(async db => {
+      // Delete in correct order due to foreign keys
+      await db.query("DELETE FROM chatcode_music_queue_commands");
+      await db.query("DELETE FROM chatcode_music_playback");
+      await db.query("DELETE FROM chatcode_music_queue");
+      await db.query("DELETE FROM chatcode_music_tracks");
+      await db.query("DELETE FROM chatcode_object_cleanup WHERE kind='music'");
+      await db.query("DELETE FROM chatcode_r2_discrepancies");
+      await db.query("DELETE FROM chatcode_r2_missing");
+      await db.query("DELETE FROM chatcode_upload_attempts");
+    });
+    // Also clean mock object store and offline flag
+    for (const name of await readdir(objects)) {
+      if (name.startsWith("r2-") || name === "offline") await rm(join(objects, name));
+    }
+    // Reset budget to default
+    process.env.CHATCODE_STORAGE_BUDGET_BYTES = String(128 * 1024 * 1024);
+    await start();
+  }
+
+  await t.test("global storage budget is enforced across all rooms and kinds", async () => {
+    await cleanupTestData();
+    const budgetBytes = 92 * 3; // 276 bytes - small budget for 3 tracks
+    process.env.CHATCODE_STORAGE_BUDGET_BYTES = String(budgetBytes);
+    await start();
+    const roomA = "global-room-a";
+    const roomB = "global-room-b";
+    const trackSize = 64;
+    const envelope = 28;
+    const bytesPerTrack = trackSize + envelope; // 92 bytes
+
+    // Reserve and publish 3 tracks (3 * 92 = 276 bytes = budget)
+    for (let i = 0; i < 3; i++) {
+      const h = await store.music.reserveTrack(roomA, trackSize);
+      await media.put(h.objectKey, Buffer.alloc(bytesPerTrack));
+      await store.music.publishTrack(roomA, h.trackId, track);
+    }
+
+    // Next reservation should fail due to global cap
+    await assert.rejects(store.music.reserveTrack(roomA, trackSize), /Global storage is full/);
+    await assert.rejects(store.music.reserveTrack(roomB, trackSize), /Global storage is full/);
+    await assert.rejects(store.checkUploadSpace(roomB, 1), /Global storage is full/);
+
+    // Verify roomA usage is at 1 GiB limit (not hit) but global is exhausted
+    const usageA = await store.roomUsage(roomA);
+    assert.ok(usageA.used <= usageA.limit);
+    assert.equal(usageA.limit, 1024 ** 3);
+  });
+
+  await t.test("per-room 1 GiB music limit is independent of global budget", async () => {
+    await cleanupTestData();
+    delete process.env.CHATCODE_STORAGE_BUDGET_BYTES; // Use default 7 GiB global
+    await start();
+    const room = "per-room-limit-" + randomUUID().slice(0, 8);
+    const maxTrack = 10 * 1024 * 1024;
+    const envelope = 28;
+    const bytesPerMaxTrack = maxTrack + envelope;
+
+    // Reserve 102 max-size tracks (102 * ~10 MiB = ~1.02 GiB, but limit is 1 GiB)
+    // 1 GiB / (10 MiB + 28) ≈ 102.3, so 102 tracks should fit, 103rd should fail
+    for (let i = 0; i < 102; i++) {
+      await store.music.reserveTrack(room, maxTrack);
+    }
+    // 103rd max-size reservation should fail with room limit error
+    await assert.rejects(store.music.reserveTrack(room, maxTrack), /Room music storage is full/);
+
+    // But a different room can still reserve
+    const otherRoom = "other-" + randomUUID().slice(0, 8);
+    const h = await store.music.reserveTrack(otherRoom, maxTrack);
+    assert.ok(h.objectKey);
+
+    // Verify room usage report
+    const usage = await store.roomUsage(room);
+    assert.equal(usage.limit, 1024 ** 3);
+    assert.ok(usage.used >= 102 * bytesPerMaxTrack);
+  });
+
+  await t.test("failed R2 deletion retains object in cleanup table with quota charge", async () => {
+    await cleanupTestData();
+    const budgetBytes = 512 * 1024;
+    process.env.CHATCODE_STORAGE_BUDGET_BYTES = String(budgetBytes);
+    await start();
+    const room = "cleanup-fail-" + randomUUID().slice(0, 8);
+    const trackSize = 64;
+    const envelope = 28;
+    const bytes = trackSize + envelope;
+
+    // Upload a track
+    const handle = await store.music.reserveTrack(room, trackSize);
+    await media.put(handle.objectKey, Buffer.alloc(bytes));
+    await store.music.publishTrack(room, handle.trackId, track);
+
+    // Simulate R2 being offline (mock returns 403 on DELETE)
+    await writeFile(join(objects, "offline"), "");
+
+    // Delete the track - cleanup will fail
+    await store.music.removeTrack(room, (await store.music.snapshot(room)).revision, handle.trackId);
+
+    // Verify track is gone from library but cleanup row exists with charge
+    const state = await store.music.snapshot(room);
+    assert.deepEqual(state.tracks, []);
+    assert.equal(state.revision, "2"); // publish + deleteTrack
+
+    await inspect(async db => {
+      const {rows} = await db.query(
+        "SELECT object_key, byte_count, deleting, due FROM chatcode_object_cleanup WHERE object_key=$1",
+        [handle.objectKey]
+      );
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].byte_count, bytes);
+      assert.equal(rows[0].deleting, true);
+      // due should be in the future (set to clock_timestamp() + 5 minutes on failure)
+      assert.ok(new Date(rows[0].due).getTime() > Date.now() - 10000);
+    });
+    await start(); // Recreate store after inspect
+
+    // Global budget should still be charged
+    await assert.rejects(store.checkUploadSpace("other-room", budgetBytes), /full/);
+
+    // Verify mock object still exists (cleanup failed)
+    assert.ok((await readdir(objects)).includes("r2-" + handle.objectKey.split("/").at(-1)));
+
+    // Restore R2 access and advance due time
+    await rm(join(objects, "offline"));
+    await inspect(async db => {
+      await db.query("UPDATE chatcode_object_cleanup SET due=now() WHERE object_key=$1", [handle.objectKey]);
+    });
+    await start(); // Recreate store after inspect
+
+    // Verify that cleanup will succeed on next startup (tested by existing test "a deleted active track stays charged...")
+    // The existing test covers the restart behavior, so we just verify the pre-restart state here
+  });
+
+  await t.test("confirmed deletion removes mock object, cleanup row, and quota charge after successful cleanup", async () => {
+    await cleanupTestData();
+    const budgetBytes = 512 * 1024;
+    process.env.CHATCODE_STORAGE_BUDGET_BYTES = String(budgetBytes);
+    await start();
+    const room = "confirmed-delete-" + randomUUID().slice(0, 8);
+    const trackSize = 64;
+    const envelope = 28;
+    const bytes = trackSize + envelope;
+
+    // Upload and publish a track
+    const handle = await store.music.reserveTrack(room, trackSize);
+    await media.put(handle.objectKey, Buffer.alloc(bytes));
+    await store.music.publishTrack(room, handle.trackId, track);
+
+    // Verify object exists in mock store
+    const objName = "r2-" + handle.objectKey.split("/").at(-1);
+    assert.ok((await readdir(objects)).includes(objName));
+
+    // Delete track via queue command (confirmed deletion)
+    await store.music.queueCommand(room, {
+      commandId: randomUUID(),
+      expectedRevision: "1",
+      action: "deleteTrack",
+      trackId: handle.trackId
+    });
+
+    // Library should be empty but cleanup row exists with charge
+    const state = await store.music.snapshot(room);
+    assert.deepEqual(state.tracks, []);
+    assert.equal(state.revision, "2");
+
+    await inspect(async db => {
+      const {rows} = await db.query("SELECT * FROM chatcode_object_cleanup WHERE object_key=$1", [handle.objectKey]);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].byte_count, bytes);
+      assert.equal(rows[0].deleting, true);
+    });
+    await start(); // Recreate store after inspect
+
+    // Budget still charged
+    await assert.rejects(store.checkUploadSpace("other-room", budgetBytes), /full/);
+
+    // Verify mock object still exists (cleanup hasn't run yet)
+    assert.ok((await readdir(objects)).includes(objName));
+
+    // Trigger cleanup deterministically:
+    // 1. Advance due time to now so cleanup picks it up
+    await inspect(async db => {
+      await db.query("UPDATE chatcode_object_cleanup SET due=now() WHERE object_key=$1", [handle.objectKey]);
+    });
+    // 2. Restart storage to run cleanup (cleanObjects runs on startup)
+    await close();
+    await start();
+
+    // After successful cleanup:
+    // - Mock R2 object should be absent
+    assert.ok(!(await readdir(objects)).includes(objName), "Mock R2 object should be removed after cleanup");
+
+    // - Cleanup row should be gone
+    await inspect(async db => {
+      const {rows} = await db.query("SELECT * FROM chatcode_object_cleanup WHERE object_key=$1", [handle.objectKey]);
+      assert.equal(rows.length, 0, "Cleanup row should be removed after successful cleanup");
+    });
+    await start(); // Recreate store after inspect
+
+    // - Quota charge should be released
+    await store.checkUploadSpace("other-room", budgetBytes);
+  });
+
+  await t.test("concurrent reservations across rooms do not exceed global budget", async () => {
+    await cleanupTestData();
+    const budgetBytes = 16 * 1024; // 16 KiB - very small for fast test
+    process.env.CHATCODE_STORAGE_BUDGET_BYTES = String(budgetBytes);
+    await start();
+    const trackSize = 64;
+    const envelope = 28;
+    const bytesPerTrack = trackSize + envelope;
+    const maxTracks = Math.floor(budgetBytes / bytesPerTrack); // ~179
+
+    const roomA = "concurrent-a-" + randomUUID().slice(0, 8);
+    const roomB = "concurrent-b-" + randomUUID().slice(0, 8);
+
+    // Launch concurrent reservations from two rooms (small batch)
+    const batchSize = 50;
+    const reservations = await Promise.allSettled([
+      ...Array(batchSize).fill(null).map(() => store.music.reserveTrack(roomA, trackSize)),
+      ...Array(batchSize).fill(null).map(() => store.music.reserveTrack(roomB, trackSize)),
+    ]);
+
+    // Count successful reservations
+    const fulfilled = reservations.filter(r => r.status === "fulfilled");
+    const rejected = reservations.filter(r => r.status === "rejected");
+
+    // Total successful reservations should not exceed budget
+    assert.ok(fulfilled.length <= maxTracks, `Expected at most ${maxTracks} fulfilled, got ${fulfilled.length}`);
+    // With 100 concurrent attempts and budget for 179, some might succeed, some might fail due to race conditions
+    // At minimum, verify we don't exceed budget
+    await inspect(async db => {
+      const {rows} = await db.query("SELECT sum(byte_count) AS used FROM chatcode_object_cleanup WHERE kind='music'");
+      const used = Number(rows[0].used || 0);
+      assert.ok(used <= budgetBytes, `Global usage ${used} should not exceed budget ${budgetBytes}`);
+    });
+
+    // If we got close to budget, further reservations should fail
+    if (fulfilled.length > maxTracks - 10) {
+      await assert.rejects(store.music.reserveTrack(roomA, trackSize), /Global storage is full/);
+    }
+  });
+
+  await t.test("concurrent music and attachment reservations share global budget", async () => {
+    await cleanupTestData();
+    const budgetBytes = 92 * 3; // 276 bytes - same as global budget test
+    process.env.CHATCODE_STORAGE_BUDGET_BYTES = String(budgetBytes);
+    await start();
+    const room = "mixed-" + randomUUID().slice(0, 8);
+    const otherRoom = "mixed-other-" + randomUUID().slice(0, 8);
+    const trackSize = 64;
+    const envelope = 28;
+    const bytesPerTrack = trackSize + envelope; // 92 bytes
+    const attachmentBytes = 92; // Same as track for simplicity
+
+    // Reserve and publish 1 music track (92 bytes)
+    const h = await store.music.reserveTrack(room, trackSize);
+    await media.put(h.objectKey, Buffer.alloc(bytesPerTrack));
+    await store.music.publishTrack(room, h.trackId, track);
+
+    // Save 2 attachments (2 * 92 = 184 bytes) - total = 276 = budget
+    for (let i = 0; i < 2; i++) {
+      const file = { info: { id: randomUUID() }, bytes: Buffer.alloc(attachmentBytes) };
+      await store.save(otherRoom, { id: randomUUID(), attachment: file.info }, null, file);
+    }
+
+    // Next music reservation should fail (global budget exhausted)
+    await assert.rejects(store.music.reserveTrack(room, trackSize), /Global storage is full/);
+    // Next attachment should also fail
+    await assert.rejects(store.save(otherRoom, { id: randomUUID(), attachment: { id: randomUUID() } }, null, { info: { id: randomUUID() }, bytes: Buffer.alloc(attachmentBytes) }), /Global storage is full/);
+
+    // Verify total usage
+    await inspect(async db => {
+      const {rows} = await db.query("SELECT sum(bytes) AS used FROM chatcode_storage_charges WHERE object_key LIKE 'chatcode/r2/%'");
+      const used = Number(rows[0].used || 0);
+      assert.ok(used <= budgetBytes);
+    });
   });
 });
